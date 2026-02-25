@@ -282,44 +282,63 @@ async function parseDocxFile(buffer: ArrayBuffer): Promise<{
   // Question code pattern: starts with uppercase letter, then digits/underscore, followed by a separator
   const qCodeRe = /^([A-Z][A-Za-z0-9_.]{0,19})\s*[-–—.:)]\s*(.*)/;
 
-  // Routing patterns — expanded to cover diverse questionnaire styles
+  // Routing patterns — covers all syntax variants found across 4 real survey pairs:
+  //   Pair 1 (EV Omnibus/Armenian):  "Ask if X=N", "(Terminate)", "(go to QN)"
+  //   Pair 2 (EU Image/English):     "ASK IF X=N", "End if X=N", "Ask the section if"
+  //   Pair 3 (Acba/Armenian):        "Ask if X=N", "(Terminate)" in answer option
+  //   Pair 4 (Barerar/CAPI):         "ASK IF X=N", "→ Go to QN", "TERMINATE" inline
   const routingPatterns: Array<{
     re: RegExp;
     parse: (m: RegExpMatchArray) => Partial<RoutingRule> | null;
   }> = [
-    // "ASK IF X=1" / "ASK IF X=1-4" / "ASK IF X=1,2,3"
+    // "Ask if X=1" / "ASK IF X=1-4" / "Ask if X=1,2,3" (all case variants)
+    // Also: "Ask this section if" / "Ask the section if" / "ASK QUESTIONS A-B IF"
     {
-      re: /ASK\s+IF\s+([A-Z][A-Za-z0-9_.]{0,19})\s*([=!<>]{1,2})\s*([\d,\-–]+)/i,
-      parse: m => ({ condVar: m[1], condOp: m[2], condVals: parseCondVals(m[3]) }),
+      re: /ASK\b.*?\bIF\s+([A-Z][A-Za-z0-9_.]{0,19})\s*([=!<>≠]{1,2})\s*([\d,\-–]+)/i,
+      parse: m => ({ condVar: m[1], condOp: normalizeOp(m[2]), condVals: parseCondVals(m[3]) }),
     },
-    // "IF X=1 ASK Y" / "IF X=1-4 ASK Y,Z"
+    // "IF X=1 ASK Y,Z" / "IF X=1-4 SHOW Y"
     {
-      re: /IF\s+([A-Z][A-Za-z0-9_.]{0,19})\s*([=!<>]{1,2})\s*([\d,\-–]+)\s+(?:ASK|GO TO|SHOW|DISPLAY)\s+(.*)/i,
-      parse: m => ({ condVar: m[1], condOp: m[2], condVals: parseCondVals(m[3]), targets: extractVarNames(m[4]) }),
+      re: /\bIF\s+([A-Z][A-Za-z0-9_.]{0,19})\s*([=!<>≠]{1,2})\s*([\d,\-–]+)\s+(?:ASK|GO\s*TO|SHOW|DISPLAY|CONTINUE)\s+(.*)/i,
+      parse: m => ({ condVar: m[1], condOp: normalizeOp(m[2]), condVals: parseCondVals(m[3]), targets: extractVarNames(m[4]) }),
     },
-    // "IF X=1 SKIP TO Y" or "SKIP X IF Y≠1"
+    // "End if X=N" / "Terminate if X=N" / "IF X=N END" / "IF X=N TERMINATE"
     {
-      re: /SKIP\s+(?:TO\s+)?([A-Z][A-Za-z0-9_.]{0,19})\s+IF\s+([A-Z][A-Za-z0-9_.]{0,19})\s*([=!<>]{1,2})\s*([\d,\-–]+)/i,
-      parse: m => ({ condVar: m[2], condOp: m[3], condVals: parseCondVals(m[4]), skipTargets: [m[1]] }),
-    },
-    // "IF X=1 END INTERVIEW" / "TERMINATE IF X=1"
-    {
-      re: /(?:IF\s+([A-Z][A-Za-z0-9_.]{0,19})\s*([=!<>]{1,2})\s*([\d,\-–]+)\s+(?:END|TERMINATE|CLOSE|STOP))|(?:(?:END|TERMINATE)\s+IF\s+([A-Z][A-Za-z0-9_.]{0,19})\s*([=!<>]{1,2})\s*([\d,\-–]+))/i,
+      re: /(?:(?:End|Terminate)\s+if\s+([A-Z][A-Za-z0-9_.]{0,19})\s*([=!<>≠]{1,2})\s*([\d,\-–]+))|(?:\bIF\s+([A-Z][A-Za-z0-9_.]{0,19})\s*([=!<>≠]{1,2})\s*([\d,\-–]+)\s+(?:END|TERMINATE|CLOSE|STOP)\b)/i,
       parse: m => m[1]
-        ? { condVar: m[1], condOp: m[2], condVals: parseCondVals(m[3]), targets: ["TERMINATE"] }
-        : { condVar: m[4], condOp: m[5], condVals: parseCondVals(m[6]), targets: ["TERMINATE"] },
+        ? { condVar: m[1], condOp: normalizeOp(m[2]), condVals: parseCondVals(m[3]), targets: ["TERMINATE"] }
+        : { condVar: m[4], condOp: normalizeOp(m[5]), condVals: parseCondVals(m[6]), targets: ["TERMINATE"] },
     },
-    // Arrow: "X=1 → Y" / "X=1-4 → Y, Z"
+    // "SKIP TO Y IF X=N" / "SKIP Y IF X≠1"
     {
-      re: /([A-Z][A-Za-z0-9_.]{0,19})\s*([=!<>]{1,2})\s*([\d,\-–]+)\s*[→➔>]+\s*(.*)/,
-      parse: m => ({ condVar: m[1], condOp: m[2], condVals: parseCondVals(m[3]), targets: extractVarNames(m[4]) }),
+      re: /SKIP\s+(?:TO\s+)?([A-Z][A-Za-z0-9_.]{0,19})\s+IF\s+([A-Z][A-Za-z0-9_.]{0,19})\s*([=!<>≠]{1,2})\s*([\d,\-–]+)/i,
+      parse: m => ({ condVar: m[2], condOp: normalizeOp(m[3]), condVals: parseCondVals(m[4]), skipTargets: [m[1]] }),
     },
-    // "Control: X=1-4" (condition-only, used as filter marker)
+    // Arrow notation: "X=1 → Y" / "X=1-4 → Y, Z" / "X=1 →Go to Y" (Pairs 1,4)
+    // ≠ sign variant: "X≠1 → Y"
     {
-      re: /[Cc]ontrol\s*[:\-]\s*([A-Z][A-Za-z0-9_.]{0,19})\s*([=!<>]{1,2})\s*([\d,\-–]+)/,
-      parse: m => ({ condVar: m[1], condOp: m[2], condVals: parseCondVals(m[3]) }),
+      re: /([A-Z][A-Za-z0-9_.]{0,19})\s*([=!<>≠]{1,2})\s*([\d,\-–]+)\s*[→➔>]+\s*(?:Go\s+to\s+)?([A-Z][A-Za-z0-9_.]*.*)/i,
+      parse: m => ({ condVar: m[1], condOp: normalizeOp(m[2]), condVals: parseCondVals(m[3]), targets: extractVarNames(m[4]) }),
+    },
+    // Inline answer option: "N: text (go to QN)" / "N: text → Go to QN CHNKARTEL"
+    {
+      re: /^\s*\d+[:\)]\s*.+?(?:go\s+to|→\s*go\s+to)\s+([A-Z][A-Za-z0-9_.]{0,19})/i,
+      parse: m => ({ condVar: "__INLINE__", condOp: "=", condVals: [], targets: extractVarNames(m[1]) }),
+    },
+    // Control list: "Control: X=1-4" / "Control list from X" (filter marker)
+    {
+      re: /[Cc]ontrol(?:\s+(?:list|the))?\s*[:\-]?\s*([A-Z][A-Za-z0-9_.]{0,19})\s*([=!<>≠]{1,2})\s*([\d,\-–]+)/,
+      parse: m => ({ condVar: m[1], condOp: normalizeOp(m[2]), condVals: parseCondVals(m[3]) }),
     },
   ];
+
+  // Normalize Armenian/Unicode comparison operators to ASCII equivalents
+  function normalizeOp(op: string): string {
+    if (op === "≠") return "!=";
+    if (op === "≤") return "<=";
+    if (op === "≥") return ">=";
+    return op;
+  }
 
   // Parse condition values like "1-4", "1,2,3", "9-10", "3-4"
   function parseCondVals(raw: string): number[] {
@@ -415,6 +434,56 @@ async function parseDocxFile(buffer: ArrayBuffer): Promise<{
   }
 
   return { questions, questionMap, routingRules, rawText, currentSection };
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// SURVEY CONVENTION KNOWLEDGE
+// Derived from analysis of 4 real SAV+DOCX pairs across multiple projects.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// Universal special codes — never flag these as invalid regardless of valid-code list
+const UNIVERSAL_SPECIAL_CODES = new Set([
+  99, 999, 9999,     // Refuse / DK / hard-coded "no answer"
+  98, 998,           // None / DK / "none of them"
+  97, 997,           // Other (specify)
+  0,                 // "NOT SELECTED" on all multi-select binary dummies
+  666666,            // LimeSurvey internal "other" code
+]);
+
+// Variable name patterns that are NEVER content-validated (only structural):
+// – open-text / verbatim variables: _T, _1T, _97T, _977T, _other, T suffix after digit
+// – coding companion variables: _coding, _coding1, _coding2
+// – specify companion variables (Barerar pattern): S_ prefix
+// – platform admin variables
+// – TOM (Top of Mind) positional mention variables: *otherSpont*, *_TOM
+// – iteration tracking (Barerar CAPI): I_N_* pattern
+// – derived/recoded variables with English names (Region, AGE, CARS, etc.)
+function isSkipValidationVar(varName: string, sv?: SavVariable): boolean {
+  const n = varName;
+  // Open-text suffixes
+  if (/(_1T|_T|_97T|_977T|_other|_OTHER)$/i.test(n)) return true;
+  // Coding companions
+  if (/(_coding\d*$)/i.test(n)) return true;
+  // Specify prefix (Barerar: S_QN_N)
+  if (/^S_/.test(n)) return true;
+  // Spontaneous mention / TOM positional
+  if (/otherSpont/i.test(n) || /_TOM$/i.test(n) || /TOM_/.test(n)) return true;
+  // Iteration tracking (Barerar: I_N_*)
+  if (/^I_\d+_/.test(n)) return true;
+  // Platform admin fields
+  if (/^(submitdate|lastpage|startlanguage|seed|startdate|datestamp|IVDate|IVDur|ContactID|UserID|UserName|UserLgIn|Latitude|Longitude|SbjNum)$/i.test(n)) return true;
+  // SAV string type — open text
+  if (sv?.type === "string") return true;
+  return false;
+}
+
+// Detect if a variable is a multi-select binary dummy (valid codes = {0,1} only)
+function isBinaryDummy(sv?: SavVariable): boolean {
+  if (!sv) return false;
+  const codes = sv.validCodes;
+  if (codes.length === 0) return false;
+  // Exclusively 0 and/or 1
+  return codes.every(c => c === 0 || c === 1);
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -516,13 +585,14 @@ function runDynamicValidation(
   function evalCondition(row: RowData, rule: RoutingRule): boolean {
     const x = getNum(row, rule.condVar);
     if (x === null) return false;
+    if (rule.condVals.length === 0) return false; // no values to evaluate
     switch (rule.condOp) {
       case "=":  return rule.condVals.includes(x);
       case "!=": return !rule.condVals.includes(x);
-      case "<":  return x < (rule.condVals[0] ?? 0);
-      case ">":  return x > (rule.condVals[0] ?? 0);
-      case "<=": return x <= (rule.condVals[0] ?? 0);
-      case ">=": return x >= (rule.condVals[0] ?? 0);
+      case "<":  return x < rule.condVals[0];
+      case ">":  return x > rule.condVals[rule.condVals.length - 1]; // compare against max of range
+      case "<=": return x <= rule.condVals[rule.condVals.length - 1];
+      case ">=": return x >= rule.condVals[0];
       default:   return false;
     }
   }
@@ -593,19 +663,29 @@ function runDynamicValidation(
       if (!dataColumns.has(sv.name)) continue;
       if (sv.type !== "numeric") continue;
       if (sv.validCodes.length === 0) continue;
-      if (emptyVal(row, sv.name)) continue; // blanks handled separately
+      if (emptyVal(row, sv.name)) continue;
+
+      // Skip open-text, coding companions, admin, iteration, TOM, binary dummies
+      if (isSkipValidationVar(sv.name, sv)) continue;
+      // Binary dummy vars (0/1): only values 0 and 1 are meaningful — skip deep validation
+      if (isBinaryDummy(sv)) continue;
 
       const val = getNum(row, sv.name);
       if (val === null) continue;
 
-      // Skip if value is a declared system-missing or missing value
+      // Never flag declared missing values or universal special codes
       if (sv.missingValues.includes(val)) continue;
+      if (UNIVERSAL_SPECIAL_CODES.has(val)) continue;
 
       if (!sv.validCodes.includes(val)) {
         const lbl = getVarLabel(sv.name, savVarMap, docxQMap);
+        // Build a human-readable code list: "1=Yes, 2=No, 3=DK"
+        const codeDesc = sv.validCodes
+          .map(c => sv.valueLabels[c] ? `${c}=${sv.valueLabels[c]}` : String(c))
+          .slice(0, 15).join(", ") + (sv.validCodes.length > 15 ? "…" : "");
         flagColTracked(id, sv.name, "MISMATCHED_CODE", val,
-          `${sv.name}=${val} is not a valid code (expected: ${sv.validCodes.slice(0,8).join(", ")}${sv.validCodes.length > 8 ? "…" : ""})`,
-          `Variable: ${lbl}\nSAV-defined valid codes: ${sv.validCodes.map(c => `${c}=${sv.valueLabels[c] ?? c}`).slice(0,15).join(", ")}${sv.validCodes.length > 15 ? "…" : ""}\nObserved value ${val} is not among them.`
+          `${sv.name}=${val} — not a valid answer code`,
+          `Question: ${lbl}\nValid codes from SAV: ${codeDesc}\nObserved value: ${val} — this code is not defined for this variable.\nNote: codes 97/98/99/999 are always allowed as DK/Refuse/Other.`
         );
       }
     }
@@ -615,12 +695,17 @@ function runDynamicValidation(
       if (!dataColumns.has(dq.code)) continue;
       if (savVarMap[dq.code]?.validCodes.length > 0) continue; // already handled by SAV
       if (emptyVal(row, dq.code)) continue;
+      if (isSkipValidationVar(dq.code, savVarMap[dq.code])) continue;
       const val = getNum(row, dq.code);
       if (val === null) continue;
+      if (UNIVERSAL_SPECIAL_CODES.has(val)) continue;
       if (dq.validCodes.length > 0 && !dq.validCodes.includes(val)) {
+        const codeDesc = dq.validCodes
+          .map(c => dq.codeLabels[c] ? `${c}=${dq.codeLabels[c]}` : String(c))
+          .slice(0, 12).join(", ");
         flagColTracked(id, dq.code, "MISMATCHED_CODE", val,
-          `${dq.code}=${val} not in docx-defined codes (${dq.validCodes.slice(0,6).join(", ")}…)`,
-          `Question: ${dq.label}\nDocx-defined valid codes: ${dq.validCodes.map(c => `${c}=${dq.codeLabels[c] ?? c}`).slice(0,12).join(", ")}\nObserved value ${val} is not among them.`
+          `${dq.code}=${val} — not a valid answer code (from questionnaire)`,
+          `Question: ${dq.label}\nValid codes from questionnaire: ${codeDesc}\nObserved value: ${val} is not among them.`
         );
       }
     }
@@ -678,7 +763,7 @@ function runDynamicValidation(
         for (const skip of rule.skipTargets) {
           if (!dataColumns.has(skip)) continue;
           const val = getNum(row, skip);
-          if (hasVal(row, skip) && val !== 99 && val !== 999 && val !== 9999) {
+          if (hasVal(row, skip) && (val === null || !UNIVERSAL_SPECIAL_CODES.has(val))) {
             const sLbl = getVarLabel(skip, savVarMap, docxQMap);
             const cLbl = getCodeLabel(rule.condVar, condVarVal, savVarMap, docxQMap);
             flagColTracked(id, skip, "SKIP_VIOLATION", val,
@@ -691,21 +776,29 @@ function runDynamicValidation(
     }
 
     // 4. Open text quality check (garbled text detection)
+    // Applies to: SAV string vars, _T/_1T/_97T/_other suffix vars, S_ prefix vars (Barerar)
     for (const col of Object.keys(row)) {
       const sv = savVarMap[col];
-      if (sv && sv.type !== "string") continue; // only string/open-text vars
-      if (sv && sv.type === "string") {
-        const txt = getStr(row, col);
-        if (!txt || txt.length < 3) continue;
-        const meaningful = (txt.match(/[\u0531-\u058Fa-zA-Z]{2,}/g) ?? []).join("").length;
-        const total = txt.replace(/\s/g, "").length;
-        if (total > 6 && meaningful / total < 0.20) {
-          const lbl = getVarLabel(col, savVarMap, docxQMap);
-          flagColTracked(id, col, "DATA_QUALITY", txt.slice(0, 60),
-            `${col}: open text appears garbled/random characters`,
-            `Variable: ${lbl}\nThe text "${txt.slice(0,80)}…" contains less than 20% recognizable Armenian/Latin characters. This is consistent with interviewers entering random characters to bypass mandatory open-text fields.`
-          );
-        }
+      const isOpenText =
+        (sv?.type === "string") ||
+        /(_1T|_T|_97T|_977T|_other|_OTHER)$/i.test(col) ||
+        /^S_/.test(col);
+      if (!isOpenText) continue;
+      // Skip coding companions even if they look like open text
+      if (/(_coding\d*$)/i.test(col)) continue;
+
+      const txt = getStr(row, col);
+      if (!txt || txt.length < 5) continue;
+
+      // Check for garbled/random characters (< 20% meaningful Armenian or Latin)
+      const meaningful = (txt.match(/[\u0531-\u058Fa-zA-Z]{2,}/g) ?? []).join("").length;
+      const total = txt.replace(/\s/g, "").length;
+      if (total > 8 && meaningful / total < 0.20) {
+        const lbl = getVarLabel(col, savVarMap, docxQMap);
+        flagColTracked(id, col, "DATA_QUALITY", txt.slice(0, 60),
+          `${col}: open text appears garbled (random characters)`,
+          `Variable: ${lbl || col}\nText recorded: "${txt.slice(0, 100)}"\nOnly ${Math.round(meaningful/total*100)}% of characters are recognizable Armenian or Latin letters.\nThis pattern is consistent with interviewers typing random characters to bypass mandatory open-text fields.`
+        );
       }
     }
   } // end row loop
