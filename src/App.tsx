@@ -78,8 +78,6 @@ function parseSavFile(buffer: ArrayBuffer): {
   const bytes = new Uint8Array(buffer);
   const latin1 = new TextDecoder("latin1");
 
-  const readI32 = (o: number) =>
-    (bytes[o] | (bytes[o+1]<<8) | (bytes[o+2]<<16) | (bytes[o+3]<<24)) >>> 0;
   const readI32s = (o: number) => // signed
     bytes[o] | (bytes[o+1]<<8) | (bytes[o+2]<<16) | (bytes[o+3]<<24);
   const readF64 = (o: number) => new DataView(buffer, o, 8).getFloat64(0, true);
@@ -503,10 +501,6 @@ function runDynamicValidation(
   };
   const hasVal = (row: RowData, col: string) => getNum(row, col) !== null || getStr(row, col) !== null;
   const emptyVal = (row: RowData, col: string) => !hasVal(row, col);
-  const eqVal = (row: RowData, col: string, v: number) => getNum(row, col) === v;
-  const inVals = (row: RowData, col: string, list: number[]) => {
-    const x = getNum(row, col); return x !== null && list.includes(x);
-  };
 
   function evalCondition(row: RowData, rule: RoutingRule): boolean {
     const x = getNum(row, rule.condVar);
