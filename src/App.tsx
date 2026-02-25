@@ -71,17 +71,27 @@ type RowData = Record<string, unknown>;
 // Record type 2 = variable records, 3/4 = value label records, 7 = info records
 // ─────────────────────────────────────────────────────────────────────────────
 
+// Try to decode bytes as UTF-8; if it fails or produces mostly replacement chars, fall back to latin1
+function smartDecode(bytes: Uint8Array, start: number, len: number): string {
+  const slice = bytes.slice(start, start + len);
+  try {
+    const utf8 = new TextDecoder("utf-8", { fatal: true }).decode(slice);
+    return utf8.trimEnd();
+  } catch {
+    return new TextDecoder("latin1").decode(slice).trimEnd();
+  }
+}
+
 function parseSavFile(buffer: ArrayBuffer): {
   variables: SavVariable[];
   varMap: Record<string, SavVariable>;
 } {
   const bytes = new Uint8Array(buffer);
-  const latin1 = new TextDecoder("latin1");
 
   const readI32s = (o: number) => // signed
     bytes[o] | (bytes[o+1]<<8) | (bytes[o+2]<<16) | (bytes[o+3]<<24);
   const readF64 = (o: number) => new DataView(buffer, o, 8).getFloat64(0, true);
-  const readStr = (o: number, n: number) => latin1.decode(bytes.slice(o, o+n)).trimEnd();
+  const readStr = (o: number, n: number) => smartDecode(bytes, o, n);
   const pad4 = (n: number) => Math.ceil(n / 4) * 4;
 
   // Verify SAV magic "$FL2" or "$FL3"
@@ -222,6 +232,7 @@ function legacySavScan(buffer: ArrayBuffer): { variables: SavVariable[]; varMap:
     "RECODE","EXECUTE","VALUE","VARIABLE","LABELS","TYPE","STRING","NUMERIC","MISSING","SYSMIS",
     "ALL","EQ","NE","LT","GT","LE","GE","SUM","MEAN","BEGIN","END","FILE","NAME","FORMAT",
     "MEASURE","ROLE","NOMINAL","SCALE","ORDINAL","INPUT","OUTPUT","YES","NO"]);
+  // Only scan for ASCII variable names; non-ASCII is labels/text, not variable names
   let ascii = "";
   for (let i = 0; i < Math.min(bytes.length, 300000); i++)
     ascii += bytes[i] < 128 ? String.fromCharCode(bytes[i]) : " ";
@@ -615,10 +626,20 @@ function runDynamicValidation(
     }
 
     // 3. Routing rule violations
+    // Strategy:
+    //   • condMet + target empty     → MISSING_DATA (required but absent)      ✓ always check
+    //   • condMet + skipTarget filled → SKIP_VIOLATION (should have been skipped) ✓ always check
+    //   • condNotMet + target filled  → only check for explicit SKIP rules (skipTargets list),
+    //                                   NOT for plain "ASK IF / IF … ASK" rules.
+    //     Reason: most questions appear in many routing rules as targets; flagging them whenever
+    //     *any one* condition is unmet causes massive false positives.  Only explicit "SKIP TO X
+    //     IF Y≠1" rules reliably tell us the variable must be empty.
     for (const rule of routingRules) {
       if (!dataColumns.has(rule.condVar)) continue;
-      const condMet = hasVal(row, rule.condVar) && evalCondition(row, rule);
-      const condNotMet = hasVal(row, rule.condVar) && !evalCondition(row, rule);
+      const condVarVal = getNum(row, rule.condVar);
+      if (condVarVal === null) continue; // condVar itself is blank — can't evaluate
+
+      const condMet = evalCondition(row, rule);
 
       const condDesc = `${rule.condVar}${rule.condOp}${rule.condVals.join(",")}`;
       const condVarLbl = getVarLabel(rule.condVar, savVarMap, docxQMap);
@@ -627,8 +648,8 @@ function runDynamicValidation(
         return lbl ? `${v}=${lbl}` : String(v);
       }).join(", ");
 
-      // If condition IS met → target variables should be present
       if (condMet) {
+        // Condition met → named targets must be present
         for (const target of rule.targets) {
           if (target === "TERMINATE") continue;
           if (!dataColumns.has(target)) continue;
@@ -636,11 +657,11 @@ function runDynamicValidation(
             const tLbl = getVarLabel(target, savVarMap, docxQMap);
             flagColTracked(id, target, "MISSING_DATA", null,
               `${target} missing — required when ${condDesc}`,
-              `Routing rule: "${rule.rawText}"\n${rule.condVar} (${condVarLbl}) = ${condValDescs}, so ${target} (${tLbl}) must be answered.\nCurrent value of ${rule.condVar}: ${getNum(row, rule.condVar)}`
+              `Routing rule: "${rule.rawText}"\n${rule.condVar} (${condVarLbl}) = ${condValDescs}, so ${target} (${tLbl}) must be answered.\nCurrent value of ${rule.condVar}: ${condVarVal}`
             );
           }
         }
-        // If condition IS met → skipTargets should be empty
+        // Condition met → explicit skipTargets must be empty
         for (const skip of rule.skipTargets) {
           if (!dataColumns.has(skip)) continue;
           if (hasVal(row, skip)) {
@@ -651,25 +672,19 @@ function runDynamicValidation(
             );
           }
         }
-      }
-
-      // If condition is NOT met → target variables should be empty (skip violation)
-      if (condNotMet) {
-        for (const target of rule.targets) {
-          if (target === "TERMINATE") continue;
-          if (!dataColumns.has(target)) continue;
-          const val = getNum(row, target);
-          if (hasVal(row, target)) {
-            // Only flag if it's not a "refusal" code (99, 999)
-            if (val !== 99 && val !== 999 && val !== 9999) {
-              const tLbl = getVarLabel(target, savVarMap, docxQMap);
-              const cVar = getNum(row, rule.condVar);
-              const cLbl = cVar !== null ? getCodeLabel(rule.condVar, cVar, savVarMap, docxQMap) : "";
-              flagColTracked(id, target, "SKIP_VIOLATION", val,
-                `${target} filled but ${rule.condVar}=${cVar}${cLbl ? ` (${cLbl})` : ""} (routing condition ${condDesc} not met)`,
-                `Routing rule: "${rule.rawText}"\n${target} (${tLbl}) should only be asked when ${condDesc}. Current ${rule.condVar}=${cVar}${cLbl ? ` (${cLbl})` : ""}, so this field should be empty.`
-              );
-            }
+      } else {
+        // Condition NOT met → only enforce explicit skip/terminate targets
+        // (i.e., variables that the docx literally says to skip)
+        for (const skip of rule.skipTargets) {
+          if (!dataColumns.has(skip)) continue;
+          const val = getNum(row, skip);
+          if (hasVal(row, skip) && val !== 99 && val !== 999 && val !== 9999) {
+            const sLbl = getVarLabel(skip, savVarMap, docxQMap);
+            const cLbl = getCodeLabel(rule.condVar, condVarVal, savVarMap, docxQMap);
+            flagColTracked(id, skip, "SKIP_VIOLATION", val,
+              `${skip} filled but should be skipped — ${rule.condVar}=${condVarVal}${cLbl ? ` (${cLbl})` : ""} (condition ${condDesc} not met)`,
+              `Routing rule: "${rule.rawText}"\nThe questionnaire explicitly says to skip ${skip} (${sLbl}) when condition ${condDesc} is not met.\nCurrent ${rule.condVar}=${condVarVal}${cLbl ? ` (${cLbl})` : ""}.`
+            );
           }
         }
       }
@@ -837,13 +852,13 @@ function ExplanationBox({ explanation }: { explanation: string }) {
 }
 
 // Column detail panel
-function ColumnPanel({ col, onClose }: { col: ColumnSummary; onClose: () => void }) {
+function ColumnPanel({ col, colIssues, onClose }: { col: ColumnSummary; colIssues: Issue[]; onClose: () => void }) {
   return (
-    <div style={{ position: "fixed", top: 0, right: 0, width: 420, height: "100vh", background: "#fff", boxShadow: "-4px 0 20px rgba(0,0,0,.12)", overflowY: "auto", zIndex: 100, padding: "20px 18px" }}>
+    <div style={{ position: "fixed", top: 0, right: 0, width: 460, height: "100vh", background: "#fff", boxShadow: "-4px 0 20px rgba(0,0,0,.12)", overflowY: "auto", zIndex: 100, padding: "20px 18px" }}>
       <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 16 }}>
         <div>
           <div style={{ fontFamily: "monospace", fontSize: 18, fontWeight: 800, color: "#1e293b" }}>{col.varName}</div>
-          <div style={{ fontSize: 12, color: "#64748b", marginTop: 2, maxWidth: 340 }}>{col.label || "—"}</div>
+          <div style={{ fontSize: 12, color: "#64748b", marginTop: 2, maxWidth: 380 }}>{col.label || "—"}</div>
         </div>
         <button onClick={onClose} style={{ background: "none", border: "none", fontSize: 18, cursor: "pointer", color: "#94a3b8" }}>✕</button>
       </div>
@@ -938,6 +953,33 @@ function ColumnPanel({ col, onClose }: { col: ColumnSummary; onClose: () => void
               <span style={{ color: "#3b82f6", fontSize: 10 }}>{r.rawText.slice(0, 150)}</span>
             </div>
           ))}
+        </div>
+      )}
+
+      {/* Issues for this column — with "Why?" explanations inline */}
+      {colIssues.length > 0 && (
+        <div style={{ marginBottom: 14 }}>
+          <div style={{ fontSize: 11, fontWeight: 700, color: "#ef4444", marginBottom: 6 }}>
+            ISSUES IN THIS COLUMN ({colIssues.length})
+          </div>
+          {colIssues.slice(0, 50).map((iss, i) => (
+            <div key={i} style={{ background: ISSUE_TYPES[iss.type].bg, border: `1px solid ${ISSUE_TYPES[iss.type].color}40`, borderRadius: 6, padding: "8px 10px", marginBottom: 6, borderLeft: `3px solid ${ISSUE_TYPES[iss.type].color}` }}>
+              <div style={{ display: "flex", gap: 6, alignItems: "center", marginBottom: 4 }}>
+                <Badge type={iss.type} />
+                <span style={{ fontSize: 11, fontWeight: 700, color: "#475569" }}>ID: {String(iss.id)}</span>
+                <span style={{ fontSize: 11, color: "#dc2626", fontFamily: "monospace" }}>
+                  {String(iss.value ?? "—").slice(0, 30)}
+                </span>
+              </div>
+              <div style={{ fontSize: 11, color: "#374151", marginBottom: 4 }}>{iss.detail}</div>
+              <ExplanationBox explanation={iss.explanation} />
+            </div>
+          ))}
+          {colIssues.length > 50 && (
+            <div style={{ fontSize: 10, color: "#94a3b8", textAlign: "center", padding: "4px 0" }}>
+              Showing first 50 of {colIssues.length} issues
+            </div>
+          )}
         </div>
       )}
     </div>
@@ -1469,7 +1511,13 @@ export default function App() {
       </div>
 
       {/* Column detail side panel */}
-      {selectedCol && <ColumnPanel col={selectedCol} onClose={() => setSelectedCol(null)} />}
+      {selectedCol && (
+        <ColumnPanel
+          col={selectedCol}
+          colIssues={issues.filter(iss => iss.variable === selectedCol.varName)}
+          onClose={() => setSelectedCol(null)}
+        />
+      )}
     </div>
   );
 }
