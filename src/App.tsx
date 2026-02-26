@@ -83,15 +83,29 @@ const UNIVERSAL_SPECIAL_CODES = new Set([
 // Record type 2 = variable records, 3/4 = value label records, 7 = info records
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Try to decode bytes as UTF-8; if it fails or produces mostly replacement chars, fall back to latin1
+// Try to decode bytes as UTF-8; if it fails, try Windows-1251 (Cyrillic/Armenian SPSS files),
+// then Windows-1252, then fall back to latin1.
 function smartDecode(bytes: Uint8Array, start: number, len: number): string {
   const slice = bytes.slice(start, start + len);
+  // 1. Try UTF-8 (preferred)
   try {
     const utf8 = new TextDecoder("utf-8", { fatal: true }).decode(slice);
     return utf8.trimEnd();
-  } catch {
-    return new TextDecoder("latin1").decode(slice).trimEnd();
-  }
+  } catch { /* not valid UTF-8 */ }
+  // 2. Try Windows-1251 (common for Armenian/Cyrillic SPSS exports)
+  try {
+    const win1251 = new TextDecoder("windows-1251", { fatal: false }).decode(slice);
+    // Check if result contains meaningful Cyrillic or Armenian characters
+    const hasCyrillic = /[\u0400-\u04FF\u0531-\u058F]/.test(win1251);
+    if (hasCyrillic) return win1251.trimEnd();
+  } catch { /* decoder not available */ }
+  // 3. Try Windows-1252 (Western European)
+  try {
+    const win1252 = new TextDecoder("windows-1252", { fatal: false }).decode(slice);
+    return win1252.trimEnd();
+  } catch { /* decoder not available */ }
+  // 4. Final fallback: latin1
+  return new TextDecoder("latin1").decode(slice).trimEnd();
 }
 
 function parseSavFile(buffer: ArrayBuffer): {
@@ -303,8 +317,68 @@ async function parseDocxFile(buffer: ArrayBuffer): Promise<{
     return [...vals];
   }
 
-  // Extract only plausible survey variable names from a string
-  // Excludes English instruction words and short noise tokens
+  // Detect scale/range patterns in a line of text.
+  // The phrasing in Armenian surveys is typically:
+  //   "...1-7 բdelays delays delays, delays 1-delays delays X, 7-delays delays Y..."
+  //   Meaning: "...answer on a 1-7 point scale, where 1 means X, 7 means Y..."
+  // The numbers are always ASCII digits. We match the N-M range pattern in context.
+  //
+  // Patterns matched:
+  //   1) "N-M" followed by Armenian script word(s) — the most common Armenian format
+  //   2) "N-M" preceded by Armenian script word(s) — alternate word order
+  //   3) "SCALE N-M" / "SCALE: N-M" — English instruction format
+  //   4) "scale of N to M" / "N to M scale/point" — English prose
+  //   5) "шdelays N-M" / "N-M шdelays" — Russian format
+  //   6) "where N means..." / "delays N-delays..." pattern confirming scale endpoints
+  function extractScaleRange(text: string): [number, number] | null {
+    // Pattern A: N-M followed or preceded by Armenian/Cyrillic text (the word for "scale", "point", etc.)
+    // We don't hardcode the Armenian words — we detect: digits-dash-digits near Armenian script
+    const rangeMatch = text.match(/(\d{1,2})\s*[-–—]\s*(\d{1,2})/);
+    if (rangeMatch) {
+      const lo = parseInt(rangeMatch[1]);
+      const hi = parseInt(rangeMatch[2]);
+      if (!isNaN(lo) && !isNaN(hi) && hi > lo && (hi - lo) >= 2 && (hi - lo) <= 20) {
+        // Check context: is this range near Armenian/Cyrillic words that suggest a scale?
+        // Armenian Unicode: \u0531-\u058F, Cyrillic: \u0400-\u04FF
+        const hasArmenianContext = /[\u0531-\u058F]{2,}/.test(text);
+        const hasCyrillicContext = /[\u0400-\u04FF]{2,}/.test(text);
+
+        // English scale keywords
+        const hasEnglishScaleWord = /\b(scale|point|score|rate|rating|grading)\b/i.test(text);
+
+        // "SCALE" as standalone instruction
+        const isScaleInstruction = /^SCALE\b/i.test(text.trim());
+
+        // The range appears in text that also has "where N means" / "delays N-" endpoint explanation
+        // This is the "delays 1-delays X, 7-delays Y" pattern
+        const hasEndpointExplanation = new RegExp(
+          `\\b${lo}\\b[^\\d]*\\b${hi}\\b`
+        ).test(text) && text.length > 20;
+
+        if (hasArmenianContext || hasCyrillicContext || hasEnglishScaleWord || isScaleInstruction || hasEndpointExplanation) {
+          return [lo, hi];
+        }
+
+        // Also match if the line is short and looks like a scale instruction
+        // e.g., "1-7" alone or "1-10 point" or "0-10"
+        if (text.trim().length < 30 && /^\s*\d{1,2}\s*[-–—]\s*\d{1,2}\s*\S*\s*$/.test(text.trim())) {
+          return [lo, hi];
+        }
+      }
+    }
+
+    // Pattern B: "scale of N to M" / "from N to M"
+    const toMatch = text.match(/(?:scale|шкал|rating)\s*(?:of|от|из)?\s*(\d{1,2})\s*(?:to|до|[-–—])\s*(\d{1,2})/i);
+    if (toMatch) {
+      const lo = parseInt(toMatch[1]);
+      const hi = parseInt(toMatch[2]);
+      if (!isNaN(lo) && !isNaN(hi) && hi > lo && (hi - lo) >= 2 && (hi - lo) <= 20) {
+        return [lo, hi];
+      }
+    }
+
+    return null;
+  }
 
   // ── Line classification helpers ────────────────────────────────────────────
 
@@ -400,8 +474,19 @@ async function parseDocxFile(buffer: ArrayBuffer): Promise<{
       continue;
     }
 
-    // 2. Pure instruction lines — skip entirely
-    if (INSTRUCTION_RE.test(line)) continue;
+    // 2. Pure instruction lines — but first extract scale hints before skipping
+    if (INSTRUCTION_RE.test(line)) {
+      // Before skipping, check if this instruction mentions a scale range
+      if (currentQ) {
+        const scaleRange = extractScaleRange(line);
+        if (scaleRange) {
+          for (let v = scaleRange[0]; v <= scaleRange[1]; v++) {
+            if (!currentQ.validCodes.includes(v)) currentQ.validCodes.push(v);
+          }
+        }
+      }
+      continue;
+    }
 
     // 3. Routing lines (standalone "Ask if …" / "End if …")
     if (ROUTING_LINE_RE.test(line)) {
@@ -471,6 +556,16 @@ async function parseDocxFile(buffer: ArrayBuffer): Promise<{
         codeLabels: {},
         section: currentSection,
       };
+
+      // Check if the question label itself contains a scale range hint
+      // e.g., "...1-7 բdelays..., delays 1 means X, 7 means Y..."
+      const scaleFromLabel = extractScaleRange(label);
+      if (scaleFromLabel) {
+        for (let v = scaleFromLabel[0]; v <= scaleFromLabel[1]; v++) {
+          if (!currentQ.validCodes.includes(v)) currentQ.validCodes.push(v);
+        }
+      }
+
       // Only register the first occurrence of each code
       if (!questionMap[code]) {
         questions.push(currentQ);
@@ -482,7 +577,17 @@ async function parseDocxFile(buffer: ArrayBuffer): Promise<{
       continue;
     }
 
-    // 6. Everything else — ignore (question body text, prose instructions, etc.)
+    // 6. Everything else — but check for scale hints in continuation lines
+    // Lines following a question like "Կrequire 1-7 բdelays" or
+    // "Answer on a 1 to 7 scale, where 1 means definitely not, 7 means definitely yes"
+    if (currentQ) {
+      const contScale = extractScaleRange(line);
+      if (contScale) {
+        for (let v = contScale[0]; v <= contScale[1]; v++) {
+          if (!currentQ.validCodes.includes(v)) currentQ.validCodes.push(v);
+        }
+      }
+    }
   }
 
   return { questions, questionMap, routingRules, rawText, currentSection };
@@ -527,6 +632,92 @@ function isBinaryDummy(sv?: SavVariable): boolean {
   if (codes.length === 0) return false;
   // Exclusively 0 and/or 1
   return codes.every(c => c === 0 || c === 1);
+}
+
+// Detect if a variable looks like a scale (e.g., 1-7, 1-10, 0-10).
+// SAV files often only define endpoint labels like "1=Definitely not" and "7=Definitely yes",
+// but all integers in between are valid answers.
+//
+// Detection strategies:
+// 1. Question label text contains a range pattern (N-M) near Armenian/Cyrillic/English text.
+//    Armenian surveys phrase it as: "Answer on a 1-7 scale, where 1 means X and 7 means Y"
+//    We don't hardcode Armenian words — we detect N-M near Armenian/Cyrillic script.
+// 2. Docx parser already expanded scale codes during parsing (from question/instruction text).
+// 3. SAV defines only 2-4 codes with a gap suggesting scale endpoints (e.g., {1,7} with labels).
+function detectScaleRange(
+  sv?: SavVariable,
+  dq?: DocxQuestion,
+): number[] | null {
+  // Strategy 1: Check question label text for N-M range pattern in context
+  const labelText = (sv?.label ?? "") + " " + (dq?.label ?? "");
+  if (labelText.trim()) {
+    const rangeMatch = labelText.match(/(\d{1,2})\s*[-–—]\s*(\d{1,2})/);
+    if (rangeMatch) {
+      const lo = parseInt(rangeMatch[1]);
+      const hi = parseInt(rangeMatch[2]);
+      if (!isNaN(lo) && !isNaN(hi) && hi > lo && (hi - lo) >= 2 && (hi - lo) <= 20) {
+        // Check if text context suggests this is a scale:
+        // Armenian script nearby (Ա-֏) — common in Armenian surveys
+        // Cyrillic script nearby (Ѐ-ӿ) — Russian surveys
+        // English scale keywords
+        const hasArmenian = /[Ա-֏]{2,}/.test(labelText);
+        const hasCyrillic = /[Ѐ-ӿ]{2,}/.test(labelText);
+        const hasEnglishScale = /(scale|point|score|rate|rating)/i.test(labelText);
+
+        if (hasArmenian || hasCyrillic || hasEnglishScale) {
+          const range: number[] = [];
+          for (let v = lo; v <= hi; v++) range.push(v);
+          return range;
+        }
+
+        // Also confirm if SAV/docx codes look like endpoints of this range
+        const codes = sv?.validCodes ?? dq?.validCodes ?? [];
+        const codesInRange = codes.filter(c => c >= lo && c <= hi);
+        if (codesInRange.length >= 1 && codesInRange.length < (hi - lo + 1)) {
+          const range: number[] = [];
+          for (let v = lo; v <= hi; v++) range.push(v);
+          return range;
+        }
+      }
+    }
+  }
+
+  // Strategy 2: Docx already expanded — if docx validCodes look like a full consecutive range,
+  // it means the docx parser detected a scale. Confirm by checking consecutiveness.
+  if (dq && dq.validCodes.length >= 3) {
+    const sorted = [...dq.validCodes].sort((a, b) => a - b);
+    const lo = sorted[0];
+    const hi = sorted[sorted.length - 1];
+    const isConsecutive = sorted.length === (hi - lo + 1) && sorted.every((v, i) => v === lo + i);
+    if (isConsecutive && (hi - lo) >= 2 && (hi - lo) <= 20) {
+      const range: number[] = [];
+      for (let v = lo; v <= hi; v++) range.push(v);
+      return range;
+    }
+  }
+
+  // Strategy 3: SAV heuristic — if SAV defines exactly 2-4 codes that look like
+  // scale endpoints (e.g., {1,7} or {1,5,10} or {0,10}), expand the range.
+  if (sv && sv.validCodes.length >= 2 && sv.validCodes.length <= 4) {
+    const codes = [...sv.validCodes].sort((a, b) => a - b);
+    const lo = codes[0];
+    const hi = codes[codes.length - 1];
+    if (hi > lo && (hi - lo) >= 3 && (hi - lo) <= 20) {
+      const expectedCount = hi - lo + 1;
+      const definedInRange = codes.filter(c => c >= lo && c <= hi).length;
+      // If less than half the range has defined labels -> scale with only endpoint labels
+      if (definedInRange < expectedCount * 0.6) {
+        const hasEndpointLabels = sv.valueLabels[lo] && sv.valueLabels[hi];
+        if (hasEndpointLabels) {
+          const range: number[] = [];
+          for (let v = lo; v <= hi; v++) range.push(v);
+          return range;
+        }
+      }
+    }
+  }
+
+  return null;
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -686,6 +877,33 @@ function runDynamicValidation(
     }
   }
 
+  // ── Scale detection pre-computation ──────────────────────────────────────
+  // For each variable, check if it's a scale and compute expanded valid codes
+  const scaleRanges: Record<string, number[]> = {};
+  const effectiveValidCodes: Record<string, number[]> = {};
+  for (const sv of savVars) {
+    const dq = docxQMap[sv.name];
+    const scaleRange = detectScaleRange(sv, dq);
+    if (scaleRange) {
+      scaleRanges[sv.name] = scaleRange;
+      // Merge scale range with any explicitly defined codes + universal special codes
+      const merged = new Set([...scaleRange, ...sv.validCodes]);
+      effectiveValidCodes[sv.name] = [...merged].sort((a, b) => a - b);
+    } else {
+      effectiveValidCodes[sv.name] = sv.validCodes;
+    }
+  }
+  // Also check docx-only variables for scales
+  for (const dq of Object.values(docxQMap)) {
+    if (savVarMap[dq.code]) continue; // already handled above
+    const scaleRange = detectScaleRange(undefined, dq);
+    if (scaleRange) {
+      scaleRanges[dq.code] = scaleRange;
+      const merged = new Set([...scaleRange, ...dq.validCodes]);
+      effectiveValidCodes[dq.code] = [...merged].sort((a, b) => a - b);
+    }
+  }
+
   // ── Per-column summary (for column-centric view) ─────────────────────────
   // We compute this during row iteration
   const colIssueCount: Record<string, number> = {};
@@ -720,15 +938,22 @@ function runDynamicValidation(
       if (sv.missingValues.includes(val)) continue;
       if (UNIVERSAL_SPECIAL_CODES.has(val)) continue;
 
-      if (!sv.validCodes.includes(val)) {
+      // Use scale-expanded codes if detected, otherwise original SAV codes
+      const validForCheck = effectiveValidCodes[sv.name] ?? sv.validCodes;
+      const isScale = !!scaleRanges[sv.name];
+
+      if (!validForCheck.includes(val)) {
         const lbl = getVarLabel(sv.name, savVarMap, docxQMap);
         // Build a human-readable code list: "1=Yes, 2=No, 3=DK"
         const codeDesc = sv.validCodes
           .map(c => sv.valueLabels[c] ? `${c}=${sv.valueLabels[c]}` : String(c))
           .slice(0, 15).join(", ") + (sv.validCodes.length > 15 ? "…" : "");
-        flagColTracked(id, sv.name, "MISMATCHED_CODE", val,
-          `${sv.name}=${val} — not a valid answer code`,
-          `Question: ${lbl}\nValid codes from SAV: ${codeDesc}\nObserved value: ${val} — this code is not defined for this variable.\nNote: codes 97/98/99/999 are always allowed as DK/Refuse/Other.`
+        const scaleNote = isScale
+          ? `\nNote: This variable was detected as a scale (${scaleRanges[sv.name][0]}-${scaleRanges[sv.name][scaleRanges[sv.name].length - 1]}). All values within the scale range are considered valid.`
+          : "";
+        flagColTracked(id, sv.name, isScale ? "OUT_OF_RANGE" : "MISMATCHED_CODE", val,
+          `${sv.name}=${val} — ${isScale ? "out of scale range" : "not a valid answer code"}`,
+          `Question: ${lbl}\nValid codes from SAV: ${codeDesc}${isScale ? ` (scale: ${scaleRanges[sv.name][0]}–${scaleRanges[sv.name][scaleRanges[sv.name].length - 1]})` : ""}\nObserved value: ${val}${scaleNote}\nNote: codes 97/98/99/999 are always allowed as DK/Refuse/Other.`
         );
       }
     }
@@ -742,13 +967,16 @@ function runDynamicValidation(
       const val = getNum(row, dq.code);
       if (val === null) continue;
       if (UNIVERSAL_SPECIAL_CODES.has(val)) continue;
-      if (dq.validCodes.length > 0 && !dq.validCodes.includes(val)) {
+      // Use scale-expanded codes if detected
+      const docxEffective = effectiveValidCodes[dq.code] ?? dq.validCodes;
+      const isScale = !!scaleRanges[dq.code];
+      if (docxEffective.length > 0 && !docxEffective.includes(val)) {
         const codeDesc = dq.validCodes
           .map(c => dq.codeLabels[c] ? `${c}=${dq.codeLabels[c]}` : String(c))
           .slice(0, 12).join(", ");
-        flagColTracked(id, dq.code, "MISMATCHED_CODE", val,
-          `${dq.code}=${val} — not a valid answer code (from questionnaire)`,
-          `Question: ${dq.label}\nValid codes from questionnaire: ${codeDesc}\nObserved value: ${val} is not among them.`
+        flagColTracked(id, dq.code, isScale ? "OUT_OF_RANGE" : "MISMATCHED_CODE", val,
+          `${dq.code}=${val} — ${isScale ? "out of scale range" : "not a valid answer code"} (from questionnaire)`,
+          `Question: ${dq.label}\nValid codes from questionnaire: ${codeDesc}${isScale ? ` (scale: ${scaleRanges[dq.code][0]}–${scaleRanges[dq.code][scaleRanges[dq.code].length - 1]})` : ""}\nObserved value: ${val} is not among them.`
         );
       }
     }
@@ -831,16 +1059,62 @@ function runDynamicValidation(
       if (/(_coding\d*$)/i.test(col)) continue;
 
       const txt = getStr(row, col);
-      if (!txt || txt.length < 5) continue;
+      if (!txt || txt.length < 3) continue;
 
-      // Check for garbled/random characters (< 20% meaningful Armenian or Latin)
-      const meaningful = (txt.match(/[\u0531-\u058Fa-zA-Z]{2,}/g) ?? []).join("").length;
       const total = txt.replace(/\s/g, "").length;
-      if (total > 8 && meaningful / total < 0.20) {
+      if (total < 3) continue;
+
+      // Check 1: Encoding artifact patterns — mojibake from double-encoding or wrong codepage
+      // Common patterns: Ô (Armenian in latin1), Ã (UTF-8 misread as latin1),
+      // Â (BOM artifacts), repeated Ð/Ñ (Cyrillic as latin1)
+      const encodingArtifacts = (txt.match(/[ÃÂÔÕÖàáâãäåèéêëìíîïðñòóôõöøùúûüý]{2,}/g) ?? []).join("").length;
+      const hasEncodingGarble = encodingArtifacts / total > 0.30;
+
+      // Check 2: Meaningful character ratio — Armenian, Cyrillic, Latin, digits, punctuation
+      // Armenian: \u0531-\u058F (uppercase + lowercase)
+      // Cyrillic: \u0400-\u04FF
+      // Latin: a-zA-Z
+      // Also count digits and common punctuation as meaningful
+      const meaningfulChars = (txt.match(/[\u0531-\u058F\u0400-\u04FFa-zA-Z0-9.,;:!?'"()\-–—/]/g) ?? []).length;
+      const meaningfulRatio = meaningfulChars / total;
+      const hasLowMeaningful = total > 5 && meaningfulRatio < 0.30;
+
+      // Check 3: Repetitive character patterns (keyboard mashing: "asdfasdf", "ааааа", "11111")
+      const hasRepetition = /(.)\1{4,}/.test(txt) || // same char 5+ times
+        /(.{2,4})\1{2,}/.test(txt); // same 2-4 char pattern 3+ times
+
+      // Check 4: Control characters or unusual Unicode blocks that shouldn't appear in survey text
+      const controlChars = (txt.match(/[\x00-\x08\x0E-\x1F\x7F-\x9F\uFFFD]/g) ?? []).length;
+      const hasControlGarble = controlChars > 0 && controlChars / total > 0.10;
+
+      // Check 5: Mixed script gibberish — text that mixes unrelated scripts unnaturally
+      // (e.g., Armenian + CJK + Latin control chars in the same short string)
+      const hasArmenian = /[\u0531-\u058F]/.test(txt);
+      const hasCyrillic = /[\u0400-\u04FF]/.test(txt);
+      const hasLatin = /[a-zA-Z]/.test(txt);
+      const hasCJK = /[\u4E00-\u9FFF\u3040-\u309F\u30A0-\u30FF]/.test(txt);
+      const scriptCount = [hasArmenian, hasCyrillic, hasLatin, hasCJK].filter(Boolean).length;
+      const suspiciousMixedScript = scriptCount >= 3 && total < 50;
+
+      // Determine issue type and message
+      let garbleReason = "";
+      if (hasEncodingGarble) {
+        garbleReason = "encoding artifacts detected (possible double-encoding or wrong codepage)";
+      } else if (hasControlGarble) {
+        garbleReason = "contains control characters or replacement characters";
+      } else if (hasLowMeaningful) {
+        garbleReason = `only ${Math.round(meaningfulRatio * 100)}% recognizable characters`;
+      } else if (hasRepetition && total < 30) {
+        garbleReason = "repetitive character pattern (possible keyboard mashing)";
+      } else if (suspiciousMixedScript) {
+        garbleReason = "unnatural mix of unrelated writing systems";
+      }
+
+      if (garbleReason) {
         const lbl = getVarLabel(col, savVarMap, docxQMap);
         flagColTracked(id, col, "DATA_QUALITY", txt.slice(0, 60),
-          `${col}: open text appears garbled (random characters)`,
-          `Variable: ${lbl || col}\nText recorded: "${txt.slice(0, 100)}"\nOnly ${Math.round(meaningful/total*100)}% of characters are recognizable Armenian or Latin letters.\nThis pattern is consistent with interviewers typing random characters to bypass mandatory open-text fields.`
+          `${col}: open text appears garbled — ${garbleReason}`,
+          `Variable: ${lbl || col}\nText recorded: "${txt.slice(0, 150)}"\n${garbleReason.charAt(0).toUpperCase() + garbleReason.slice(1)}.\n${meaningfulRatio < 1 ? `Meaningful character ratio: ${Math.round(meaningfulRatio * 100)}%\n` : ""}This may indicate encoding corruption, interviewer typing random characters, or data import issues.`
         );
       }
     }
@@ -882,12 +1156,15 @@ function runDynamicValidation(
         return { val, cnt, label: lbl };
       });
 
+    const isScale = !!scaleRanges[varName];
+    const scaleArr = scaleRanges[varName];
+
     columnSummary.push({
       varName,
       label,
       section: dq?.section ?? sv?.label ?? "",
       type: sv?.type ?? "unknown",
-      validCodes: validCodes ?? [],
+      validCodes: effectiveValidCodes[varName] ?? validCodes ?? [],
       valueLabels: sv?.valueLabels ?? dq?.codeLabels ?? {},
       nFilled,
       nEmpty,
@@ -898,6 +1175,8 @@ function runDynamicValidation(
       condRules,
       hasInDocx: !!dq,
       hasInSav: !!sv,
+      isScale,
+      scaleRange: isScale && scaleArr ? [scaleArr[0], scaleArr[scaleArr.length - 1]] : undefined,
     });
   }
 
@@ -924,6 +1203,8 @@ interface ColumnSummary {
   condRules: RoutingRule[];
   hasInDocx: boolean;
   hasInSav: boolean;
+  isScale: boolean;
+  scaleRange?: [number, number];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1000,10 +1281,11 @@ function ColumnPanel({ col, colIssues, onClose }: { col: ColumnSummary; colIssue
       </div>
 
       {/* Source badges */}
-      <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+      <div style={{ display: "flex", gap: 6, marginBottom: 14, flexWrap: "wrap" }}>
         {col.hasInSav && <span style={{ background: "#fef9c3", border: "1px solid #fde047", borderRadius: 4, fontSize: 10, padding: "2px 7px", color: "#854d0e" }}>🗃 SAV-defined</span>}
         {col.hasInDocx && <span style={{ background: "#f0fdf4", border: "1px solid #86efac", borderRadius: 4, fontSize: 10, padding: "2px 7px", color: "#166534" }}>📝 Docx-defined</span>}
         <span style={{ background: "#f1f5f9", border: "1px solid #e2e8f0", borderRadius: 4, fontSize: 10, padding: "2px 7px", color: "#475569" }}>{col.type}</span>
+        {col.isScale && col.scaleRange && <span style={{ background: "#fdf4ff", border: "1px solid #e9d5ff", borderRadius: 4, fontSize: 10, padding: "2px 7px", color: "#7c3aed" }}>📏 Scale {col.scaleRange[0]}–{col.scaleRange[1]}</span>}
       </div>
 
       {/* Fill stats */}
@@ -1330,8 +1612,8 @@ export default function App() {
               {loading ? "⏳ Analyzing…" : "🚀 Run Validation"}
             </button>
             <div style={{ background: "#fffbeb", border: "1px solid #fde68a", borderRadius: 6, padding: "6px 10px", fontSize: 10, color: "#92400e" }}>
-              💡 SAV defines what's valid. Docx defines routing. CSV is the data to check.<br />
-              All rules are derived from your files — nothing is hardcoded.
+              💡 <strong>SAV is the primary authority</strong> — it defines valid codes, variable types, and value labels.<br />
+              Docx adds routing/skip logic. CSV/Excel is the data to validate. All rules are derived from your files.
             </div>
           </div>
         </div>
@@ -1450,9 +1732,10 @@ export default function App() {
                               </div>
                             </Td>
                             <Td>
-                              <div style={{ display: "flex", gap: 3 }}>
+                              <div style={{ display: "flex", gap: 3, flexWrap: "wrap" }}>
                                 {col.hasInSav && <span style={{ fontSize: 9, background: "#fef9c3", border: "1px solid #fde047", borderRadius: 3, padding: "1px 4px", color: "#854d0e" }}>SAV</span>}
                                 {col.hasInDocx && <span style={{ fontSize: 9, background: "#f0fdf4", border: "1px solid #86efac", borderRadius: 3, padding: "1px 4px", color: "#166534" }}>DOCX</span>}
+                                {col.isScale && col.scaleRange && <span style={{ fontSize: 9, background: "#fdf4ff", border: "1px solid #e9d5ff", borderRadius: 3, padding: "1px 4px", color: "#7c3aed" }}>{col.scaleRange[0]}–{col.scaleRange[1]}</span>}
                               </div>
                             </Td>
                           </tr>
