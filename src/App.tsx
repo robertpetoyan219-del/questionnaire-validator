@@ -66,6 +66,18 @@ interface DocxQuestion {
 type RowData = Record<string, unknown>;
 
 // ─────────────────────────────────────────────────────────────────────────────
+// UNIVERSAL SPECIAL CODES
+// These appear across ALL your surveys. Never flag them as invalid answer codes.
+// ─────────────────────────────────────────────────────────────────────────────
+const UNIVERSAL_SPECIAL_CODES = new Set([
+  99, 999, 9999,     // Refuse / DK / no answer
+  98, 998,           // None / DK / "none of them"
+  97, 997,           // Other (specify)
+  0,                 // NOT SELECTED on binary multi-select dummies
+  666666,            // LimeSurvey internal "other" code
+]);
+
+// ─────────────────────────────────────────────────────────────────────────────
 // SAV BINARY PARSER
 // Parses SPSS .sav (System file) format:
 // Record type 2 = variable records, 3/4 = value label records, 7 = info records
@@ -270,167 +282,207 @@ async function parseDocxFile(buffer: ArrayBuffer): Promise<{
   const questions: DocxQuestion[] = [];
   const questionMap: Record<string, DocxQuestion> = {};
   const routingRules: RoutingRule[] = [];
-
-  // Section detection
-  const sectionKeywords = [
-    "SCREENING", "SECTION", "DEMOGRAPH", "INFORMATION SOURCE",
-    "AWARENESS", "ATTITUDE", "EU IMAGE", "EU DELEGATION",
-    "INTERNATIONAL ORGAN", "FUNDED PROJECT",
-  ];
   let currentSection = "General";
+  let currentQ: DocxQuestion | null = null;
 
-  // Question code pattern: starts with uppercase letter, then digits/underscore, followed by a separator
-  const qCodeRe = /^([A-Z][A-Za-z0-9_.]{0,19})\s*[-–—.:)]\s*(.*)/;
+  // ── Helpers ────────────────────────────────────────────────────────────────
 
-  // Routing patterns — covers all syntax variants found across 4 real survey pairs:
-  //   Pair 1 (EV Omnibus/Armenian):  "Ask if X=N", "(Terminate)", "(go to QN)"
-  //   Pair 2 (EU Image/English):     "ASK IF X=N", "End if X=N", "Ask the section if"
-  //   Pair 3 (Acba/Armenian):        "Ask if X=N", "(Terminate)" in answer option
-  //   Pair 4 (Barerar/CAPI):         "ASK IF X=N", "→ Go to QN", "TERMINATE" inline
-  const routingPatterns: Array<{
-    re: RegExp;
-    parse: (m: RegExpMatchArray) => Partial<RoutingRule> | null;
-  }> = [
-    // "Ask if X=1" / "ASK IF X=1-4" / "Ask if X=1,2,3" (all case variants)
-    // Also: "Ask this section if" / "Ask the section if" / "ASK QUESTIONS A-B IF"
-    {
-      re: /ASK\b.*?\bIF\s+([A-Z][A-Za-z0-9_.]{0,19})\s*([=!<>≠]{1,2})\s*([\d,\-–]+)/i,
-      parse: m => ({ condVar: m[1], condOp: normalizeOp(m[2]), condVals: parseCondVals(m[3]) }),
-    },
-    // "IF X=1 ASK Y,Z" / "IF X=1-4 SHOW Y"
-    {
-      re: /\bIF\s+([A-Z][A-Za-z0-9_.]{0,19})\s*([=!<>≠]{1,2})\s*([\d,\-–]+)\s+(?:ASK|GO\s*TO|SHOW|DISPLAY|CONTINUE)\s+(.*)/i,
-      parse: m => ({ condVar: m[1], condOp: normalizeOp(m[2]), condVals: parseCondVals(m[3]), targets: extractVarNames(m[4]) }),
-    },
-    // "End if X=N" / "Terminate if X=N" / "IF X=N END" / "IF X=N TERMINATE"
-    {
-      re: /(?:(?:End|Terminate)\s+if\s+([A-Z][A-Za-z0-9_.]{0,19})\s*([=!<>≠]{1,2})\s*([\d,\-–]+))|(?:\bIF\s+([A-Z][A-Za-z0-9_.]{0,19})\s*([=!<>≠]{1,2})\s*([\d,\-–]+)\s+(?:END|TERMINATE|CLOSE|STOP)\b)/i,
-      parse: m => m[1]
-        ? { condVar: m[1], condOp: normalizeOp(m[2]), condVals: parseCondVals(m[3]), targets: ["TERMINATE"] }
-        : { condVar: m[4], condOp: normalizeOp(m[5]), condVals: parseCondVals(m[6]), targets: ["TERMINATE"] },
-    },
-    // "SKIP TO Y IF X=N" / "SKIP Y IF X≠1"
-    {
-      re: /SKIP\s+(?:TO\s+)?([A-Z][A-Za-z0-9_.]{0,19})\s+IF\s+([A-Z][A-Za-z0-9_.]{0,19})\s*([=!<>≠]{1,2})\s*([\d,\-–]+)/i,
-      parse: m => ({ condVar: m[2], condOp: normalizeOp(m[3]), condVals: parseCondVals(m[4]), skipTargets: [m[1]] }),
-    },
-    // Arrow notation: "X=1 → Y" / "X=1-4 → Y, Z" / "X=1 →Go to Y" (Pairs 1,4)
-    // ≠ sign variant: "X≠1 → Y"
-    {
-      re: /([A-Z][A-Za-z0-9_.]{0,19})\s*([=!<>≠]{1,2})\s*([\d,\-–]+)\s*[→➔>]+\s*(?:Go\s+to\s+)?([A-Z][A-Za-z0-9_.]*.*)/i,
-      parse: m => ({ condVar: m[1], condOp: normalizeOp(m[2]), condVals: parseCondVals(m[3]), targets: extractVarNames(m[4]) }),
-    },
-    // Inline answer option: "N: text (go to QN)" / "N: text → Go to QN CHNKARTEL"
-    {
-      re: /^\s*\d+[:\)]\s*.+?(?:go\s+to|→\s*go\s+to)\s+([A-Z][A-Za-z0-9_.]{0,19})/i,
-      parse: m => ({ condVar: "__INLINE__", condOp: "=", condVals: [], targets: extractVarNames(m[1]) }),
-    },
-    // Control list: "Control: X=1-4" / "Control list from X" (filter marker)
-    {
-      re: /[Cc]ontrol(?:\s+(?:list|the))?\s*[:\-]?\s*([A-Z][A-Za-z0-9_.]{0,19})\s*([=!<>≠]{1,2})\s*([\d,\-–]+)/,
-      parse: m => ({ condVar: m[1], condOp: normalizeOp(m[2]), condVals: parseCondVals(m[3]) }),
-    },
-  ];
-
-  // Normalize Armenian/Unicode comparison operators to ASCII equivalents
+  // Normalize Unicode operators → ASCII
   function normalizeOp(op: string): string {
-    if (op === "≠") return "!=";
-    if (op === "≤") return "<=";
-    if (op === "≥") return ">=";
-    return op;
+    return op === "≠" ? "!=" : op === "≤" ? "<=" : op === "≥" ? ">=" : op;
   }
 
-  // Parse condition values like "1-4", "1,2,3", "9-10", "3-4"
+  // Parse "1-4", "1,2,3", "9,10", "1-3,5" into [1,2,3,4] / [1,2,3] / [9,10] / [1,2,3,5]
   function parseCondVals(raw: string): number[] {
     const vals = new Set<number>();
     for (const part of raw.split(",")) {
-      const rangeMatch = part.trim().match(/^(\d+)\s*[-–]\s*(\d+)$/);
-      if (rangeMatch) {
-        const lo = parseInt(rangeMatch[1]), hi = parseInt(rangeMatch[2]);
-        for (let v = lo; v <= hi; v++) vals.add(v);
-      } else {
-        const n = parseInt(part.trim());
-        if (!isNaN(n)) vals.add(n);
-      }
+      const r = part.trim().match(/^(\d+)\s*[-–]\s*(\d+)$/);
+      if (r) { for (let v = +r[1]; v <= +r[2]; v++) vals.add(v); }
+      else { const n = parseInt(part.trim()); if (!isNaN(n)) vals.add(n); }
     }
     return [...vals];
   }
 
-  function extractVarNames(text: string): string[] {
-    const out: string[] = [];
-    const re2 = /\b([A-Z][A-Za-z0-9_.]{0,19})\b/g;
-    let m2: RegExpExecArray | null;
-    while ((m2 = re2.exec(text)) !== null) {
-      const nm = m2[1];
-      if (nm.length >= 2 && nm !== "ASK" && nm !== "GO" && nm !== "TO" && nm !== "IF" && nm !== "AND" && nm !== "OR") {
-        out.push(nm);
+  // Extract only plausible survey variable names from a string
+  // Excludes English instruction words and short noise tokens
+
+  // ── Line classification helpers ────────────────────────────────────────────
+
+  // Lines that are purely interviewer instructions — never a question or answer code
+  const INSTRUCTION_RE = /^(ԿԱՐԴԱԼ|ՉԿԱՐԴԱԼ|Read\s+if|Do\s+not\s+read|INT\s*:|Rotate|Bring\s+brands|Control\s+(list|the)|If\s+in\s+.*\bdo\s+not|Automatically\s+code|Show\s+\d|REGISTER|INTEGRATE|MULTIPLE|SINGLE|OPEN\s+(RESPONSE|ANSWER)|Multiple\s+response|Single\s+response|Single\s+answer|Multiple\s+answer|Open\s+(response|answer)|ՄԻ\s+ՔԱՆԻ|ՄԵԿ\s+ՊԱՏاHԱՆ|ROTATE|SCALE|BRING|CORON|Recall|Remind|Read\s+the|Record|Please\s+be|Your\s+Tel|This\s+is|This\s+call|Text\s+in|NPS|MAX\s+\d|Recoding\s+key)/i;
+
+  // Section header patterns:
+  //   =ԲԱԺԻՆ 1. TITLE= (Armenian)
+  //   = Мас 1. TITLE   (Russian transliteration)
+  //   Section1: Title  (English)
+  //   =бажин N.        (lowercase Armenian)
+  const SECTION_RE = /^(?:=+\s*(?:ԲԱԺԻՆ|бажин|Мас|МАС|SECTION|Section)\s*\d|Section\s*\d\s*:|=\s*Мас\s+\d)/i;
+
+  // Routing trigger lines — the whole line is a routing instruction
+  // Must start with Ask/ASK or End/Terminate, and contain a condition
+  const ROUTING_LINE_RE = /^(?:Ask\s+(?:if|all|this\s+section|the\s+section|questions)|ASK\s+(?:IF|ALL|THIS\s+SECTION|THE\s+SECTION|QUESTIONS)|End\s+if|Terminate\s+if)/i;
+
+  // Answer option line: starts with a number then ":" or "։" (Armenian colon) or ")"
+  // e.g. "1: Yes", "2։ No (Terminate)", "97: Other"
+  const ANSWER_RE = /^(\d{1,5})\s*[：:։)]\s*(.+)$/;
+
+  // Question line: VAR_CODE. Question text
+  // Code must be ALL-CAPS start, contain at least one digit OR be a known alpha code (S0, B1, etc.)
+  // Separators: . ․ (Armenian middle dot) : – — )
+  // The code must NOT be a pure number
+  const QUESTION_RE = /^([A-Z][A-Za-z0-9_.]{0,19})\s*[.․:–—)]\s*(.{2,})/;
+
+  // Words/phrases that look like question codes but are actually instructions
+  const FAKE_CODE_WORDS = new Set([
+    "CATI","CAPI","NPS","INT","END","ASK","ALL","MULTIPLE","SINGLE","OPEN",
+    "ROTATE","BRING","CONTROL","SCALE","READ","DO","ID","CODE","AGE","SEX",
+    "YES","NO","MAX","MIN","TOM","PROM","TEXT","Note","URL","PC","TV","SMS",
+  ]);
+
+  // ── Routing condition parser ───────────────────────────────────────────────
+  // Handles:
+  //   "Ask if S0=1"
+  //   "Ask if S5=1 and (S7≠1 AND S7≠2) and S9≠1"   → multiple conditions (AND)
+  //   "ASK QUESTIONS G2-G6 IF G1=1-3"
+  //   "ASK THIS SECTION IF BR1=2 or 3"              → "or 3" = additional value for same var
+  //   "End if S4=98 or 999"
+  //   "Terminate if S5=2 and S9=2"  (from inline answer option text)
+  //   "ASK IF E16 ≠ 97"
+  //   "ASK IF E3<5"
+  //   "ASK IF BR1=1-3"
+
+  function parseRoutingLine(line: string): RoutingRule[] {
+    const rules: RoutingRule[] = [];
+
+    // Strip leading verb: "Ask if", "ASK IF", "ASK QUESTIONS X-Y IF", "ASK THIS SECTION IF",
+    //                     "End if", "Terminate if"
+    let body = line
+      .replace(/^Ask\s+(?:if|questions\s+[A-Z0-9_,\-–]+\s+if|this\s+section\s+if|the\s+section\s+if)/i, "")
+      .replace(/^ASK\s+(?:IF|QUESTIONS\s+[A-Z0-9_,\-–]+\s+IF|THIS\s+SECTION\s+IF|THE\s+SECTION\s+IF)/i, "")
+      .replace(/^(?:End|Terminate)\s+if/i, "")
+      .trim();
+
+    // Split on AND/and/&&, process each condition sub-clause
+    // Each sub-clause looks like: VAR OP VALUE  or  VAR OP VALUE1,VALUE2  or  (VAR OP VALUE)
+    const clauses = body.split(/\s+AND\s+|\s*&&\s*/i);
+
+    for (const clause of clauses) {
+      const clean = clause.replace(/[()]/g, "").trim();
+
+      // Single condition: VAR OP VALS
+      // Also handles "or N" continuation: "S4=98 or 999" → vals=[98,999]
+      const m = clean.match(
+        /^([A-Z][A-Za-z0-9_.]{0,19})\s*([=!<>≠]{1,2})\s*([\d,\-–]+(?:\s+or\s+[\d,\-–]+)*)/i
+      );
+      if (m) {
+        const condVar = m[1];
+        const condOp = normalizeOp(m[2]);
+        // Handle "98 or 999" → "98,999"
+        const valStr = m[3].replace(/\s+or\s+/gi, ",");
+        const condVals = parseCondVals(valStr);
+        if (condVar && condVals.length > 0) {
+          rules.push({ condVar, condOp, condVals, targets: [], skipTargets: [], rawText: line.slice(0, 200) });
+        }
       }
     }
-    return out;
+
+    return rules;
   }
 
-  // Code list pattern: lines like "1 = Yes" / "1=Yes" / "1. Yes"
-  const codeLabelRe = /^\s*(\d+)\s*[=.\-:)]\s*(.+)$/;
-
-  let currentQ: DocxQuestion | null = null;
+  // ── Per-line processing ───────────────────────────────────────────────────
 
   for (const line of lines) {
-    // ── Section detection ────────────────────────────────────────────────
-    const upperLine = line.toUpperCase();
-    if (sectionKeywords.some(kw => upperLine.includes(kw))) {
-      currentSection = line.slice(0, 80);
+
+    // 1. Section headers
+    if (SECTION_RE.test(line)) {
+      currentSection = line.replace(/^=+|=+$/g, "").trim().slice(0, 80);
+      currentQ = null;
+      continue;
     }
 
-    // ── Routing rule extraction ──────────────────────────────────────────
-    for (const { re, parse } of routingPatterns) {
-      const m = line.match(re);
-      if (m) {
-        const partial = parse(m);
-        if (partial && partial.condVar) {
-          routingRules.push({
-            condVar: partial.condVar!,
-            condOp: partial.condOp ?? "=",
-            condVals: partial.condVals ?? [],
-            targets: partial.targets ?? [],
-            skipTargets: partial.skipTargets ?? [],
-            rawText: line.slice(0, 200),
-          });
+    // 2. Pure instruction lines — skip entirely
+    if (INSTRUCTION_RE.test(line)) continue;
+
+    // 3. Routing lines (standalone "Ask if …" / "End if …")
+    if (ROUTING_LINE_RE.test(line)) {
+      const parsed = parseRoutingLine(line);
+      routingRules.push(...parsed);
+      // Don't set currentQ — routing line is a filter, not a question
+      continue;
+    }
+
+    // 4. Answer option lines — "N: text" or "N։ text"
+    const am = line.match(ANSWER_RE);
+    if (am) {
+      const code = parseInt(am[1]);
+      const label = am[2].trim();
+      if (!isNaN(code) && label.length > 0) {
+        // Attach to current question's code labels
+        if (currentQ && !UNIVERSAL_SPECIAL_CODES.has(code)) {
+          // Strip inline instructions from label: "(Terminate)", "TERMINATE", "(go to X)", "ЧKАРДАЛ", "ЧКАРDАЛ"
+          const cleanLabel = label
+            .replace(/\s*\(Terminate[^)]*\)/gi, "")
+            .replace(/\s*TERMINATE\b/gi, "")
+            .replace(/\s*\(go\s+to\s+\S+\)/gi, "")
+            .replace(/\s*→\s*Go\s+to\s+\S+.*/i, "")
+            .replace(/\s*CONTINUE\b/gi, "")
+            .replace(/ՉԿԱՐԴԱԼchinese|ЧКАРDАЛ|ЧKАРДАЛ/g, "")
+            .trim();
+          if (cleanLabel) {
+            currentQ.codeLabels[code] = cleanLabel;
+            if (!currentQ.validCodes.includes(code)) currentQ.validCodes.push(code);
+          }
         }
-        break;
+
+        // Check for inline routing: "(Terminate if X=N)" / "(go to QN)"
+        const terminateInline = label.match(/(?:Terminate\s+if|terminate\s+if)\s+([A-Z][A-Za-z0-9_.]{0,19})\s*([=!<>≠]{1,2})\s*([\d,\-–]+(?:\s+and\s+[A-Z][A-Za-z0-9_.]{0,19}\s*[=!<>≠]{1,2}\s*[\d,\-–]+)*)/i);
+        if (terminateInline) {
+          const parsed = parseRoutingLine("Terminate if " + terminateInline[1] + terminateInline[2] + terminateInline[3]);
+          routingRules.push(...parsed);
+        }
+        // "(go to QN)" — note as skip but without condVar we can't enforce it
+        // Arrow "→ Go to QN" in answer option
       }
+      continue;
     }
 
-    // ── Question code detection ──────────────────────────────────────────
-    const qm = line.match(qCodeRe);
-    if (qm && qm[1].length >= 1 && qm[1].length <= 12) {
-      // Plausibility: code must look like a survey variable (not a sentence)
+    // 5. Question lines — "VARCODE. Question text" or "VARCODE․ text"
+    const qm = line.match(QUESTION_RE);
+    if (qm) {
       const code = qm[1];
       const label = qm[2].trim();
-      if (/^[A-Z][A-Za-z0-9_.]*$/.test(code)) {
-        currentQ = {
-          code,
-          label: label.slice(0, 300),
-          validCodes: [],
-          codeLabels: {},
-          section: currentSection,
-        };
+
+      // Reject fake codes
+      if (FAKE_CODE_WORDS.has(code)) continue;
+      // Code must look like a survey variable: starts uppercase, reasonable length
+      if (code.length < 1 || code.length > 15) continue;
+      // Must contain a digit OR be a well-known single-letter+digit pattern (S0, B1, G9, etc.)
+      // Reject pure alphabetic codes that are too long (likely English words/instructions)
+      const looksLikeVar = /\d/.test(code) || /^[A-Z]\d/.test(code);
+      if (!looksLikeVar) continue;
+      // Reject if label starts with a lowercase letter (likely a sentence continuation, not a question)
+      // Exception: Armenian characters always start uppercase
+      if (/^[a-z]/.test(label)) continue;
+
+      currentQ = {
+        code,
+        label: label.slice(0, 300),
+        validCodes: [],
+        codeLabels: {},
+        section: currentSection,
+      };
+      // Only register the first occurrence of each code
+      if (!questionMap[code]) {
         questions.push(currentQ);
         questionMap[code] = currentQ;
+      } else {
+        // Update section/label if we see it again with more context
+        currentQ = questionMap[code];
       }
+      continue;
     }
 
-    // ── Code/answer option extraction (under current question) ───────────
-    if (currentQ) {
-      const cm = line.match(codeLabelRe);
-      if (cm) {
-        const code = parseInt(cm[1]);
-        const lbl = cm[2].trim();
-        if (!isNaN(code) && code >= 0 && code <= 99999 && lbl.length > 0) {
-          currentQ.codeLabels[code] = lbl;
-          if (!currentQ.validCodes.includes(code)) currentQ.validCodes.push(code);
-        }
-      }
-    }
+    // 6. Everything else — ignore (question body text, prose instructions, etc.)
   }
 
   return { questions, questionMap, routingRules, rawText, currentSection };
@@ -440,15 +492,6 @@ async function parseDocxFile(buffer: ArrayBuffer): Promise<{
 // SURVEY CONVENTION KNOWLEDGE
 // Derived from analysis of 4 real SAV+DOCX pairs across multiple projects.
 // ─────────────────────────────────────────────────────────────────────────────
-
-// Universal special codes — never flag these as invalid regardless of valid-code list
-const UNIVERSAL_SPECIAL_CODES = new Set([
-  99, 999, 9999,     // Refuse / DK / hard-coded "no answer"
-  98, 998,           // None / DK / "none of them"
-  97, 997,           // Other (specify)
-  0,                 // "NOT SELECTED" on all multi-select binary dummies
-  666666,            // LimeSurvey internal "other" code
-]);
 
 // Variable name patterns that are NEVER content-validated (only structural):
 // – open-text / verbatim variables: _T, _1T, _97T, _977T, _other, T suffix after digit
