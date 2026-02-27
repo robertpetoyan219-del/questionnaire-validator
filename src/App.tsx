@@ -1,7 +1,5 @@
 import { useState, useCallback, useRef } from "react";
 import type { ReactNode } from "react";
-import * as XLSX from "xlsx";
-import Papa from "papaparse";
 import mammoth from "mammoth";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -63,7 +61,6 @@ interface DocxQuestion {
   section: string;       // section name
 }
 
-type RowData = Record<string, unknown>;
 
 // ─────────────────────────────────────────────────────────────────────────────
 // UNIVERSAL SPECIAL CODES
@@ -83,15 +80,29 @@ const UNIVERSAL_SPECIAL_CODES = new Set([
 // Record type 2 = variable records, 3/4 = value label records, 7 = info records
 // ─────────────────────────────────────────────────────────────────────────────
 
-// Try to decode bytes as UTF-8; if it fails or produces mostly replacement chars, fall back to latin1
+// Try to decode bytes as UTF-8; if it fails, try Windows-1251 (Cyrillic/Armenian SPSS files),
+// then Windows-1252, then fall back to latin1.
 function smartDecode(bytes: Uint8Array, start: number, len: number): string {
   const slice = bytes.slice(start, start + len);
+  // 1. Try UTF-8 (preferred)
   try {
     const utf8 = new TextDecoder("utf-8", { fatal: true }).decode(slice);
     return utf8.trimEnd();
-  } catch {
-    return new TextDecoder("latin1").decode(slice).trimEnd();
-  }
+  } catch { /* not valid UTF-8 */ }
+  // 2. Try Windows-1251 (common for Armenian/Cyrillic SPSS exports)
+  try {
+    const win1251 = new TextDecoder("windows-1251", { fatal: false }).decode(slice);
+    // Check if result contains meaningful Cyrillic or Armenian characters
+    const hasCyrillic = /[\u0400-\u04FF\u0531-\u058F]/.test(win1251);
+    if (hasCyrillic) return win1251.trimEnd();
+  } catch { /* decoder not available */ }
+  // 3. Try Windows-1252 (Western European)
+  try {
+    const win1252 = new TextDecoder("windows-1252", { fatal: false }).decode(slice);
+    return win1252.trimEnd();
+  } catch { /* decoder not available */ }
+  // 4. Final fallback: latin1
+  return new TextDecoder("latin1").decode(slice).trimEnd();
 }
 
 function parseSavFile(buffer: ArrayBuffer): {
@@ -303,8 +314,68 @@ async function parseDocxFile(buffer: ArrayBuffer): Promise<{
     return [...vals];
   }
 
-  // Extract only plausible survey variable names from a string
-  // Excludes English instruction words and short noise tokens
+  // Detect scale/range patterns in a line of text.
+  // The phrasing in Armenian surveys is typically:
+  //   "...1-7 բdelays delays delays, delays 1-delays delays X, 7-delays delays Y..."
+  //   Meaning: "...answer on a 1-7 point scale, where 1 means X, 7 means Y..."
+  // The numbers are always ASCII digits. We match the N-M range pattern in context.
+  //
+  // Patterns matched:
+  //   1) "N-M" followed by Armenian script word(s) — the most common Armenian format
+  //   2) "N-M" preceded by Armenian script word(s) — alternate word order
+  //   3) "SCALE N-M" / "SCALE: N-M" — English instruction format
+  //   4) "scale of N to M" / "N to M scale/point" — English prose
+  //   5) "шdelays N-M" / "N-M шdelays" — Russian format
+  //   6) "where N means..." / "delays N-delays..." pattern confirming scale endpoints
+  function extractScaleRange(text: string): [number, number] | null {
+    // Pattern A: N-M followed or preceded by Armenian/Cyrillic text (the word for "scale", "point", etc.)
+    // We don't hardcode the Armenian words — we detect: digits-dash-digits near Armenian script
+    const rangeMatch = text.match(/(\d{1,2})\s*[-–—]\s*(\d{1,2})/);
+    if (rangeMatch) {
+      const lo = parseInt(rangeMatch[1]);
+      const hi = parseInt(rangeMatch[2]);
+      if (!isNaN(lo) && !isNaN(hi) && hi > lo && (hi - lo) >= 2 && (hi - lo) <= 20) {
+        // Check context: is this range near Armenian/Cyrillic words that suggest a scale?
+        // Armenian Unicode: \u0531-\u058F, Cyrillic: \u0400-\u04FF
+        const hasArmenianContext = /[\u0531-\u058F]{2,}/.test(text);
+        const hasCyrillicContext = /[\u0400-\u04FF]{2,}/.test(text);
+
+        // English scale keywords
+        const hasEnglishScaleWord = /\b(scale|point|score|rate|rating|grading)\b/i.test(text);
+
+        // "SCALE" as standalone instruction
+        const isScaleInstruction = /^SCALE\b/i.test(text.trim());
+
+        // The range appears in text that also has "where N means" / "delays N-" endpoint explanation
+        // This is the "delays 1-delays X, 7-delays Y" pattern
+        const hasEndpointExplanation = new RegExp(
+          `\\b${lo}\\b[^\\d]*\\b${hi}\\b`
+        ).test(text) && text.length > 20;
+
+        if (hasArmenianContext || hasCyrillicContext || hasEnglishScaleWord || isScaleInstruction || hasEndpointExplanation) {
+          return [lo, hi];
+        }
+
+        // Also match if the line is short and looks like a scale instruction
+        // e.g., "1-7" alone or "1-10 point" or "0-10"
+        if (text.trim().length < 30 && /^\s*\d{1,2}\s*[-–—]\s*\d{1,2}\s*\S*\s*$/.test(text.trim())) {
+          return [lo, hi];
+        }
+      }
+    }
+
+    // Pattern B: "scale of N to M" / "from N to M"
+    const toMatch = text.match(/(?:scale|шкал|rating)\s*(?:of|от|из)?\s*(\d{1,2})\s*(?:to|до|[-–—])\s*(\d{1,2})/i);
+    if (toMatch) {
+      const lo = parseInt(toMatch[1]);
+      const hi = parseInt(toMatch[2]);
+      if (!isNaN(lo) && !isNaN(hi) && hi > lo && (hi - lo) >= 2 && (hi - lo) <= 20) {
+        return [lo, hi];
+      }
+    }
+
+    return null;
+  }
 
   // ── Line classification helpers ────────────────────────────────────────────
 
@@ -400,8 +471,19 @@ async function parseDocxFile(buffer: ArrayBuffer): Promise<{
       continue;
     }
 
-    // 2. Pure instruction lines — skip entirely
-    if (INSTRUCTION_RE.test(line)) continue;
+    // 2. Pure instruction lines — but first extract scale hints before skipping
+    if (INSTRUCTION_RE.test(line)) {
+      // Before skipping, check if this instruction mentions a scale range
+      if (currentQ) {
+        const scaleRange = extractScaleRange(line);
+        if (scaleRange) {
+          for (let v = scaleRange[0]; v <= scaleRange[1]; v++) {
+            if (!currentQ.validCodes.includes(v)) currentQ.validCodes.push(v);
+          }
+        }
+      }
+      continue;
+    }
 
     // 3. Routing lines (standalone "Ask if …" / "End if …")
     if (ROUTING_LINE_RE.test(line)) {
@@ -471,6 +553,16 @@ async function parseDocxFile(buffer: ArrayBuffer): Promise<{
         codeLabels: {},
         section: currentSection,
       };
+
+      // Check if the question label itself contains a scale range hint
+      // e.g., "...1-7 բdelays..., delays 1 means X, 7 means Y..."
+      const scaleFromLabel = extractScaleRange(label);
+      if (scaleFromLabel) {
+        for (let v = scaleFromLabel[0]; v <= scaleFromLabel[1]; v++) {
+          if (!currentQ.validCodes.includes(v)) currentQ.validCodes.push(v);
+        }
+      }
+
       // Only register the first occurrence of each code
       if (!questionMap[code]) {
         questions.push(currentQ);
@@ -482,7 +574,17 @@ async function parseDocxFile(buffer: ArrayBuffer): Promise<{
       continue;
     }
 
-    // 6. Everything else — ignore (question body text, prose instructions, etc.)
+    // 6. Everything else — but check for scale hints in continuation lines
+    // Lines following a question like "Կrequire 1-7 բdelays" or
+    // "Answer on a 1 to 7 scale, where 1 means definitely not, 7 means definitely yes"
+    if (currentQ) {
+      const contScale = extractScaleRange(line);
+      if (contScale) {
+        for (let v = contScale[0]; v <= contScale[1]; v++) {
+          if (!currentQ.validCodes.includes(v)) currentQ.validCodes.push(v);
+        }
+      }
+    }
   }
 
   return { questions, questionMap, routingRules, rawText, currentSection };
@@ -529,6 +631,92 @@ function isBinaryDummy(sv?: SavVariable): boolean {
   return codes.every(c => c === 0 || c === 1);
 }
 
+// Detect if a variable looks like a scale (e.g., 1-7, 1-10, 0-10).
+// SAV files often only define endpoint labels like "1=Definitely not" and "7=Definitely yes",
+// but all integers in between are valid answers.
+//
+// Detection strategies:
+// 1. Question label text contains a range pattern (N-M) near Armenian/Cyrillic/English text.
+//    Armenian surveys phrase it as: "Answer on a 1-7 scale, where 1 means X and 7 means Y"
+//    We don't hardcode Armenian words — we detect N-M near Armenian/Cyrillic script.
+// 2. Docx parser already expanded scale codes during parsing (from question/instruction text).
+// 3. SAV defines only 2-4 codes with a gap suggesting scale endpoints (e.g., {1,7} with labels).
+function detectScaleRange(
+  sv?: SavVariable,
+  dq?: DocxQuestion,
+): number[] | null {
+  // Strategy 1: Check question label text for N-M range pattern in context
+  const labelText = (sv?.label ?? "") + " " + (dq?.label ?? "");
+  if (labelText.trim()) {
+    const rangeMatch = labelText.match(/(\d{1,2})\s*[-–—]\s*(\d{1,2})/);
+    if (rangeMatch) {
+      const lo = parseInt(rangeMatch[1]);
+      const hi = parseInt(rangeMatch[2]);
+      if (!isNaN(lo) && !isNaN(hi) && hi > lo && (hi - lo) >= 2 && (hi - lo) <= 20) {
+        // Check if text context suggests this is a scale:
+        // Armenian script nearby (Ա-֏) — common in Armenian surveys
+        // Cyrillic script nearby (Ѐ-ӿ) — Russian surveys
+        // English scale keywords
+        const hasArmenian = /[Ա-֏]{2,}/.test(labelText);
+        const hasCyrillic = /[Ѐ-ӿ]{2,}/.test(labelText);
+        const hasEnglishScale = /(scale|point|score|rate|rating)/i.test(labelText);
+
+        if (hasArmenian || hasCyrillic || hasEnglishScale) {
+          const range: number[] = [];
+          for (let v = lo; v <= hi; v++) range.push(v);
+          return range;
+        }
+
+        // Also confirm if SAV/docx codes look like endpoints of this range
+        const codes = sv?.validCodes ?? dq?.validCodes ?? [];
+        const codesInRange = codes.filter(c => c >= lo && c <= hi);
+        if (codesInRange.length >= 1 && codesInRange.length < (hi - lo + 1)) {
+          const range: number[] = [];
+          for (let v = lo; v <= hi; v++) range.push(v);
+          return range;
+        }
+      }
+    }
+  }
+
+  // Strategy 2: Docx already expanded — if docx validCodes look like a full consecutive range,
+  // it means the docx parser detected a scale. Confirm by checking consecutiveness.
+  if (dq && dq.validCodes.length >= 3) {
+    const sorted = [...dq.validCodes].sort((a, b) => a - b);
+    const lo = sorted[0];
+    const hi = sorted[sorted.length - 1];
+    const isConsecutive = sorted.length === (hi - lo + 1) && sorted.every((v, i) => v === lo + i);
+    if (isConsecutive && (hi - lo) >= 2 && (hi - lo) <= 20) {
+      const range: number[] = [];
+      for (let v = lo; v <= hi; v++) range.push(v);
+      return range;
+    }
+  }
+
+  // Strategy 3: SAV heuristic — if SAV defines exactly 2-4 codes that look like
+  // scale endpoints (e.g., {1,7} or {1,5,10} or {0,10}), expand the range.
+  if (sv && sv.validCodes.length >= 2 && sv.validCodes.length <= 4) {
+    const codes = [...sv.validCodes].sort((a, b) => a - b);
+    const lo = codes[0];
+    const hi = codes[codes.length - 1];
+    if (hi > lo && (hi - lo) >= 3 && (hi - lo) <= 20) {
+      const expectedCount = hi - lo + 1;
+      const definedInRange = codes.filter(c => c >= lo && c <= hi).length;
+      // If less than half the range has defined labels -> scale with only endpoint labels
+      if (definedInRange < expectedCount * 0.6) {
+        const hasEndpointLabels = sv.valueLabels[lo] && sv.valueLabels[hi];
+        if (hasEndpointLabels) {
+          const range: number[] = [];
+          for (let v = lo; v <= hi; v++) range.push(v);
+          return range;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // DYNAMIC VALIDATION ENGINE
 // No hardcoded survey knowledge. All rules derive from SAV + docx metadata.
@@ -562,19 +750,6 @@ function getVarLabel(
   return varName;
 }
 
-function getCodeLabel(
-  varName: string,
-  code: number,
-  savVarMap: Record<string, SavVariable>,
-  docxQMap: Record<string, DocxQuestion>,
-): string {
-  const sv = savVarMap[varName];
-  if (sv?.valueLabels[code]) return sv.valueLabels[code];
-  const dq = docxQMap[varName];
-  if (dq?.codeLabels[code]) return dq.codeLabels[code];
-  return "";
-}
-
 // Build a map: condVar → list of routing rules, so we can look up "what does X=1 imply"
 function buildRoutingIndex(rules: RoutingRule[]): Record<string, RoutingRule[]> {
   const idx: Record<string, RoutingRule[]> = {};
@@ -592,8 +767,7 @@ function findGatingRules(
   return rules.filter(r => r.targets.includes(varName) || r.skipTargets.includes(varName));
 }
 
-function runDynamicValidation(
-  data: RowData[],
+function runStructuralValidation(
   savVars: SavVariable[],
   savVarMap: Record<string, SavVariable>,
   docxQMap: Record<string, DocxQuestion>,
@@ -602,261 +776,169 @@ function runDynamicValidation(
 
   const issues: Issue[] = [];
   const datasetWarnings: DatasetWarning[] = [];
-  const n = data.length;
-  if (n === 0) return { issues, datasetWarnings, columnSummary: [] };
-
-  const dataColumns = new Set(Object.keys(data[0]));
   const routingIndex = buildRoutingIndex(routingRules);
 
-  // ── Helpers ─────────────────────────────────────────────────────────────
-
-  const getNum = (row: RowData, col: string): number | null => {
-    const raw = row[col];
-    if (raw === null || raw === undefined || raw === "" || raw === ".") return null;
-    const n = Number(String(raw).trim());
-    return isNaN(n) ? null : n;
+  const flag = (variable: string, type: IssueType, value: unknown, detail: string, explanation: string) => {
+    issues.push({ id: variable, variable, type, value, detail, explanation });
   };
-  const getStr = (row: RowData, col: string): string | null => {
-    const raw = row[col];
-    if (raw == null) return null;
-    const s = String(raw).trim();
-    return s === "" || s === "." ? null : s;
-  };
-  const hasVal = (row: RowData, col: string) => getNum(row, col) !== null || getStr(row, col) !== null;
-  const emptyVal = (row: RowData, col: string) => !hasVal(row, col);
 
-  function evalCondition(row: RowData, rule: RoutingRule): boolean {
-    const x = getNum(row, rule.condVar);
-    if (x === null) return false;
-    if (rule.condVals.length === 0) return false; // no values to evaluate
-    switch (rule.condOp) {
-      case "=":  return rule.condVals.includes(x);
-      case "!=": return !rule.condVals.includes(x);
-      case "<":  return x < rule.condVals[0];
-      case ">":  return x > rule.condVals[rule.condVals.length - 1]; // compare against max of range
-      case "<=": return x <= rule.condVals[rule.condVals.length - 1];
-      case ">=": return x >= rule.condVals[0];
-      default:   return false;
+  // ── Scale detection pre-computation ──────────────────────────────────────
+  const scaleRanges: Record<string, number[]> = {};
+  const effectiveValidCodes: Record<string, number[]> = {};
+  for (const sv of savVars) {
+    const dq = docxQMap[sv.name];
+    const scaleRange = detectScaleRange(sv, dq);
+    if (scaleRange) {
+      scaleRanges[sv.name] = scaleRange;
+      const merged = new Set([...scaleRange, ...sv.validCodes]);
+      effectiveValidCodes[sv.name] = [...merged].sort((a, b) => a - b);
+    } else {
+      effectiveValidCodes[sv.name] = sv.validCodes;
+    }
+  }
+  for (const dq of Object.values(docxQMap)) {
+    if (savVarMap[dq.code]) continue;
+    const scaleRange = detectScaleRange(undefined, dq);
+    if (scaleRange) {
+      scaleRanges[dq.code] = scaleRange;
+      const merged = new Set([...scaleRange, ...dq.validCodes]);
+      effectiveValidCodes[dq.code] = [...merged].sort((a, b) => a - b);
     }
   }
 
-  const flag = (id: unknown, variable: string, type: IssueType, value: unknown, detail: string, explanation: string) => {
-    issues.push({ id: id as string | number, variable, type, value, detail, explanation });
-  };
-
-  // ── Dataset-level: SAV vars not in CSV ──────────────────────────────────
-  const criticalSavVars = savVars.filter(sv =>
-    sv.type === "numeric" &&
-    sv.validCodes.length > 0 &&
-    !dataColumns.has(sv.name)
-  );
-  // Report only first 10 to avoid noise
-  for (const sv of criticalSavVars.slice(0, 10)) {
-    datasetWarnings.push({
-      type: "STRUCTURAL",
-      variable: sv.name,
-      detail: `Column "${sv.name}" is defined in the SAV file but MISSING from the data export`,
-      explanation: `The SAV file defines variable "${sv.name}" (${sv.label || "no label"}) with ${sv.validCodes.length} valid codes, but this column does not exist in the uploaded CSV/Excel data. This indicates an incomplete data export from SPSS. Re-export with all variables included.`,
-    });
-  }
-  if (criticalSavVars.length > 10) {
-    datasetWarnings.push({
-      type: "STRUCTURAL",
-      variable: "(multiple)",
-      detail: `${criticalSavVars.length - 10} more SAV-defined columns are missing from the data export`,
-      explanation: `SAV defines ${criticalSavVars.length} variables total that are absent from the CSV. Only the first 10 are listed individually. Please re-export from SPSS with all columns.`,
-    });
-  }
-
-  // ── Duplicate ID check ───────────────────────────────────────────────────
-  const idKey = data[0] ? (["id","ID","Id","RespondentID","respondent_id"].find(k => k in data[0])) : undefined;
-  if (idKey) {
-    const seen = new Set<unknown>(), dupes = new Set<unknown>();
-    data.forEach(r => {
-      const v = r[idKey];
-      if (v != null) { if (seen.has(v)) dupes.add(v); seen.add(v); }
-    });
-    if (dupes.size > 0) {
-      datasetWarnings.push({
-        type: "STRUCTURAL",
-        variable: idKey,
-        detail: `Duplicate respondent IDs: ${[...dupes].slice(0,20).join(", ")}`,
-        explanation: "Each respondent should have a unique ID. Duplicates indicate a merge error or repeated import.",
-      });
-    }
-  }
-
-  // ── Per-column summary (for column-centric view) ─────────────────────────
-  // We compute this during row iteration
+  // ── Per-column issue tracking ──────────────────────────────────────────
   const colIssueCount: Record<string, number> = {};
   const colIssueTypes: Record<string, Set<IssueType>> = {};
-
-  const flagColTracked = (id: unknown, variable: string, type: IssueType, value: unknown, detail: string, explanation: string) => {
-    flag(id, variable, type, value, detail, explanation);
+  const flagCol = (variable: string, type: IssueType, value: unknown, detail: string, explanation: string) => {
+    flag(variable, type, value, detail, explanation);
     colIssueCount[variable] = (colIssueCount[variable] ?? 0) + 1;
     (colIssueTypes[variable] ??= new Set()).add(type);
   };
 
-  // ── Row-level validation ─────────────────────────────────────────────────
-  for (const row of data) {
-    const id = (idKey ? row[idKey] : null) ?? row.id ?? row.ID ?? "?";
+  // ── Structural check 1: SAV variables not in DOCX ─────────────────────
+  const docxCodes = new Set(Object.keys(docxQMap));
+  if (docxCodes.size > 0) {
+    const savNotInDocx = savVars.filter(sv =>
+      sv.type === "numeric" &&
+      sv.validCodes.length > 0 &&
+      !docxCodes.has(sv.name)
+    );
+    for (const sv of savNotInDocx.slice(0, 15)) {
+      datasetWarnings.push({
+        type: "STRUCTURAL",
+        variable: sv.name,
+        detail: `SAV variable "${sv.name}" not found in DOCX questionnaire`,
+        explanation: `The SAV file defines variable "${sv.name}" (${sv.label || "no label"}) with ${sv.validCodes.length} valid codes, but no matching question was found in the DOCX. This may indicate different variable naming conventions or a question that was added after the questionnaire was finalized.`,
+      });
+    }
+    if (savNotInDocx.length > 15) {
+      datasetWarnings.push({
+        type: "STRUCTURAL",
+        variable: "(multiple)",
+        detail: `${savNotInDocx.length - 15} more SAV variables not found in DOCX`,
+        explanation: `SAV defines ${savNotInDocx.length} variables total that have no matching DOCX question.`,
+      });
+    }
+  }
 
-    // 1. Valid code checks (for every SAV-defined numeric variable)
-    for (const sv of savVars) {
-      if (!dataColumns.has(sv.name)) continue;
-      if (sv.type !== "numeric") continue;
-      if (sv.validCodes.length === 0) continue;
-      if (emptyVal(row, sv.name)) continue;
+  // ── Structural check 2: DOCX questions not in SAV ─────────────────────
+  if (savVars.length > 0) {
+    const docxNotInSav = Object.values(docxQMap).filter(dq =>
+      !savVarMap[dq.code] &&
+      dq.validCodes.length > 0
+    );
+    for (const dq of docxNotInSav.slice(0, 15)) {
+      datasetWarnings.push({
+        type: "STRUCTURAL",
+        variable: dq.code,
+        detail: `DOCX question "${dq.code}" not found in SAV file`,
+        explanation: `The questionnaire defines question "${dq.code}" (${dq.label.slice(0, 80)}) with codes [${dq.validCodes.slice(0, 8).join(",")}], but no matching variable exists in the SAV. This may indicate the question was removed or renamed during data processing.`,
+      });
+    }
+    if (docxNotInSav.length > 15) {
+      datasetWarnings.push({
+        type: "STRUCTURAL",
+        variable: "(multiple)",
+        detail: `${docxNotInSav.length - 15} more DOCX questions not found in SAV`,
+        explanation: `${docxNotInSav.length} DOCX questions total have no matching SAV variable.`,
+      });
+    }
+  }
 
-      // Skip open-text, coding companions, admin, iteration, TOM, binary dummies
-      if (isSkipValidationVar(sv.name, sv)) continue;
-      // Binary dummy vars (0/1): only values 0 and 1 are meaningful — skip deep validation
-      if (isBinaryDummy(sv)) continue;
+  // ── Structural check 3: Code mismatches between SAV and DOCX ──────────
+  // For each variable that exists in both, compare the valid code sets.
+  // SAV is authoritative, but DOCX may define codes the SAV doesn't (or vice versa).
+  for (const sv of savVars) {
+    const dq = docxQMap[sv.name];
+    if (!dq) continue;
+    if (sv.validCodes.length === 0 && dq.validCodes.length === 0) continue;
+    if (isSkipValidationVar(sv.name, sv)) continue;
+    if (isBinaryDummy(sv)) continue;
 
-      const val = getNum(row, sv.name);
-      if (val === null) continue;
+    const isScale = !!scaleRanges[sv.name];
+    const savCodes = new Set(effectiveValidCodes[sv.name] ?? sv.validCodes);
+    const docxCodes = new Set(effectiveValidCodes[dq.code] ?? dq.validCodes);
 
-      // Never flag declared missing values or universal special codes
-      if (sv.missingValues.includes(val)) continue;
-      if (UNIVERSAL_SPECIAL_CODES.has(val)) continue;
+    if (savCodes.size === 0 || docxCodes.size === 0) continue;
 
-      if (!sv.validCodes.includes(val)) {
-        const lbl = getVarLabel(sv.name, savVarMap, docxQMap);
-        // Build a human-readable code list: "1=Yes, 2=No, 3=DK"
-        const codeDesc = sv.validCodes
-          .map(c => sv.valueLabels[c] ? `${c}=${sv.valueLabels[c]}` : String(c))
-          .slice(0, 15).join(", ") + (sv.validCodes.length > 15 ? "…" : "");
-        flagColTracked(id, sv.name, "MISMATCHED_CODE", val,
-          `${sv.name}=${val} — not a valid answer code`,
-          `Question: ${lbl}\nValid codes from SAV: ${codeDesc}\nObserved value: ${val} — this code is not defined for this variable.\nNote: codes 97/98/99/999 are always allowed as DK/Refuse/Other.`
-        );
+    // Codes in DOCX but not in SAV (DOCX has extra codes)
+    const extraInDocx = [...docxCodes].filter(c => !savCodes.has(c) && !UNIVERSAL_SPECIAL_CODES.has(c));
+    // Codes in SAV but not in DOCX (SAV has extra codes)  
+    const extraInSav = [...savCodes].filter(c => !docxCodes.has(c) && !UNIVERSAL_SPECIAL_CODES.has(c));
+
+    if (extraInDocx.length > 0 || extraInSav.length > 0) {
+      const lbl = sv.label || dq.label || sv.name;
+      const savDesc = [...savCodes].sort((a,b)=>a-b).map(c => sv.valueLabels[c] ? `${c}=${sv.valueLabels[c]}` : String(c)).slice(0, 15).join(", ");
+      const docxDesc = [...docxCodes].sort((a,b)=>a-b).map(c => dq.codeLabels[c] ? `${c}=${dq.codeLabels[c]}` : String(c)).slice(0, 15).join(", ");
+
+      let detail = `${sv.name}: code mismatch between SAV and DOCX`;
+      let explanation = `Question: ${lbl}\nSAV codes: [${savDesc}]${isScale ? " (scale)" : ""}\nDOCX codes: [${docxDesc}]${isScale ? " (scale)" : ""}`;
+      if (extraInDocx.length > 0) {
+        explanation += `\nIn DOCX but not SAV: [${extraInDocx.sort((a,b)=>a-b).join(", ")}]`;
+      }
+      if (extraInSav.length > 0) {
+        explanation += `\nIn SAV but not DOCX: [${extraInSav.sort((a,b)=>a-b).join(", ")}]`;
+      }
+      explanation += "\nNote: SAV is the primary authority. DOCX differences may indicate the questionnaire and data file are out of sync.";
+
+      flagCol(sv.name, "MISMATCHED_CODE", null, detail, explanation);
+    }
+  }
+
+  // ── Structural check 4: Routing rule references ───────────────────────
+  // Check that routing rules reference variables that actually exist
+  const allKnownVars = new Set([...savVars.map(sv => sv.name), ...Object.keys(docxQMap)]);
+  for (const rule of routingRules) {
+    // Check condition variable
+    if (rule.condVar && !allKnownVars.has(rule.condVar)) {
+      datasetWarnings.push({
+        type: "STRUCTURAL",
+        variable: rule.condVar,
+        detail: `Routing rule references unknown variable "${rule.condVar}"`,
+        explanation: `Rule: "${rule.rawText}"\nThe condition variable "${rule.condVar}" is not found in either SAV or DOCX.`,
+      });
+    }
+    // Check target variables
+    for (const target of [...rule.targets, ...rule.skipTargets]) {
+      if (!allKnownVars.has(target)) {
+        datasetWarnings.push({
+          type: "STRUCTURAL",
+          variable: target,
+          detail: `Routing rule targets unknown variable "${target}"`,
+          explanation: `Rule: "${rule.rawText}"\nThe target variable "${target}" is not found in either SAV or DOCX.`,
+        });
       }
     }
-
-    // 2. Docx-sourced valid code checks (variables not in SAV but in docx)
-    for (const dq of Object.values(docxQMap)) {
-      if (!dataColumns.has(dq.code)) continue;
-      if (savVarMap[dq.code]?.validCodes.length > 0) continue; // already handled by SAV
-      if (emptyVal(row, dq.code)) continue;
-      if (isSkipValidationVar(dq.code, savVarMap[dq.code])) continue;
-      const val = getNum(row, dq.code);
-      if (val === null) continue;
-      if (UNIVERSAL_SPECIAL_CODES.has(val)) continue;
-      if (dq.validCodes.length > 0 && !dq.validCodes.includes(val)) {
-        const codeDesc = dq.validCodes
-          .map(c => dq.codeLabels[c] ? `${c}=${dq.codeLabels[c]}` : String(c))
-          .slice(0, 12).join(", ");
-        flagColTracked(id, dq.code, "MISMATCHED_CODE", val,
-          `${dq.code}=${val} — not a valid answer code (from questionnaire)`,
-          `Question: ${dq.label}\nValid codes from questionnaire: ${codeDesc}\nObserved value: ${val} is not among them.`
-        );
-      }
-    }
-
-    // 3. Routing rule violations
-    // Strategy:
-    //   • condMet + target empty     → MISSING_DATA (required but absent)      ✓ always check
-    //   • condMet + skipTarget filled → SKIP_VIOLATION (should have been skipped) ✓ always check
-    //   • condNotMet + target filled  → only check for explicit SKIP rules (skipTargets list),
-    //                                   NOT for plain "ASK IF / IF … ASK" rules.
-    //     Reason: most questions appear in many routing rules as targets; flagging them whenever
-    //     *any one* condition is unmet causes massive false positives.  Only explicit "SKIP TO X
-    //     IF Y≠1" rules reliably tell us the variable must be empty.
-    for (const rule of routingRules) {
-      if (!dataColumns.has(rule.condVar)) continue;
-      const condVarVal = getNum(row, rule.condVar);
-      if (condVarVal === null) continue; // condVar itself is blank — can't evaluate
-
-      const condMet = evalCondition(row, rule);
-
-      const condDesc = `${rule.condVar}${rule.condOp}${rule.condVals.join(",")}`;
-      const condVarLbl = getVarLabel(rule.condVar, savVarMap, docxQMap);
-      const condValDescs = rule.condVals.map(v => {
-        const lbl = getCodeLabel(rule.condVar, v, savVarMap, docxQMap);
-        return lbl ? `${v}=${lbl}` : String(v);
-      }).join(", ");
-
-      if (condMet) {
-        // Condition met → named targets must be present
-        for (const target of rule.targets) {
-          if (target === "TERMINATE") continue;
-          if (!dataColumns.has(target)) continue;
-          if (emptyVal(row, target)) {
-            const tLbl = getVarLabel(target, savVarMap, docxQMap);
-            flagColTracked(id, target, "MISSING_DATA", null,
-              `${target} missing — required when ${condDesc}`,
-              `Routing rule: "${rule.rawText}"\n${rule.condVar} (${condVarLbl}) = ${condValDescs}, so ${target} (${tLbl}) must be answered.\nCurrent value of ${rule.condVar}: ${condVarVal}`
-            );
-          }
-        }
-        // Condition met → explicit skipTargets must be empty
-        for (const skip of rule.skipTargets) {
-          if (!dataColumns.has(skip)) continue;
-          if (hasVal(row, skip)) {
-            const sLbl = getVarLabel(skip, savVarMap, docxQMap);
-            flagColTracked(id, skip, "SKIP_VIOLATION", getNum(row, skip),
-              `${skip} filled but should be skipped when ${condDesc}`,
-              `Routing rule: "${rule.rawText}"\nWhen ${condDesc} (${condVarLbl}=${condValDescs}), ${skip} (${sLbl}) should be empty.`
-            );
-          }
-        }
-      } else {
-        // Condition NOT met → only enforce explicit skip/terminate targets
-        // (i.e., variables that the docx literally says to skip)
-        for (const skip of rule.skipTargets) {
-          if (!dataColumns.has(skip)) continue;
-          const val = getNum(row, skip);
-          if (hasVal(row, skip) && (val === null || !UNIVERSAL_SPECIAL_CODES.has(val))) {
-            const sLbl = getVarLabel(skip, savVarMap, docxQMap);
-            const cLbl = getCodeLabel(rule.condVar, condVarVal, savVarMap, docxQMap);
-            flagColTracked(id, skip, "SKIP_VIOLATION", val,
-              `${skip} filled but should be skipped — ${rule.condVar}=${condVarVal}${cLbl ? ` (${cLbl})` : ""} (condition ${condDesc} not met)`,
-              `Routing rule: "${rule.rawText}"\nThe questionnaire explicitly says to skip ${skip} (${sLbl}) when condition ${condDesc} is not met.\nCurrent ${rule.condVar}=${condVarVal}${cLbl ? ` (${cLbl})` : ""}.`
-            );
-          }
-        }
-      }
-    }
-
-    // 4. Open text quality check (garbled text detection)
-    // Applies to: SAV string vars, _T/_1T/_97T/_other suffix vars, S_ prefix vars (Barerar)
-    for (const col of Object.keys(row)) {
-      const sv = savVarMap[col];
-      const isOpenText =
-        (sv?.type === "string") ||
-        /(_1T|_T|_97T|_977T|_other|_OTHER)$/i.test(col) ||
-        /^S_/.test(col);
-      if (!isOpenText) continue;
-      // Skip coding companions even if they look like open text
-      if (/(_coding\d*$)/i.test(col)) continue;
-
-      const txt = getStr(row, col);
-      if (!txt || txt.length < 5) continue;
-
-      // Check for garbled/random characters (< 20% meaningful Armenian or Latin)
-      const meaningful = (txt.match(/[\u0531-\u058Fa-zA-Z]{2,}/g) ?? []).join("").length;
-      const total = txt.replace(/\s/g, "").length;
-      if (total > 8 && meaningful / total < 0.20) {
-        const lbl = getVarLabel(col, savVarMap, docxQMap);
-        flagColTracked(id, col, "DATA_QUALITY", txt.slice(0, 60),
-          `${col}: open text appears garbled (random characters)`,
-          `Variable: ${lbl || col}\nText recorded: "${txt.slice(0, 100)}"\nOnly ${Math.round(meaningful/total*100)}% of characters are recognizable Armenian or Latin letters.\nThis pattern is consistent with interviewers typing random characters to bypass mandatory open-text fields.`
-        );
-      }
-    }
-  } // end row loop
+  }
 
   // ── Build per-column summary ─────────────────────────────────────────────
   const columnSummary: ColumnSummary[] = [];
   const allVarNames = [
     ...savVars.map(sv => sv.name),
     ...Object.keys(docxQMap).filter(k => !savVarMap[k]),
-    ...Object.keys(data[0] ?? {}).filter(k => !savVarMap[k] && !docxQMap[k]),
   ].filter((v, i, a) => a.indexOf(v) === i); // unique
 
   for (const varName of allVarNames) {
-    if (!dataColumns.has(varName)) continue;
-
     const sv = savVarMap[varName];
     const dq = docxQMap[varName];
     const label = getVarLabel(varName, savVarMap, docxQMap);
@@ -864,40 +946,24 @@ function runDynamicValidation(
     const gatingRules = findGatingRules(varName, routingRules);
     const condRules = routingIndex[varName] ?? [];
 
-    // Compute value frequency in data
-    const freqMap: Record<string, number> = {};
-    let nFilled = 0, nEmpty = 0;
-    for (const row of data) {
-      const v = getStr(row, varName);
-      if (v === null) { nEmpty++; continue; }
-      nFilled++;
-      freqMap[v] = (freqMap[v] ?? 0) + 1;
-    }
-    const topValues = Object.entries(freqMap)
-      .sort((a, b) => b[1] - a[1])
-      .slice(0, 10)
-      .map(([val, cnt]) => {
-        const numVal = Number(val);
-        const lbl = !isNaN(numVal) ? getCodeLabel(varName, numVal, savVarMap, docxQMap) : "";
-        return { val, cnt, label: lbl };
-      });
+    const isScale = !!scaleRanges[varName];
+    const scaleArr = scaleRanges[varName];
 
     columnSummary.push({
       varName,
       label,
       section: dq?.section ?? sv?.label ?? "",
       type: sv?.type ?? "unknown",
-      validCodes: validCodes ?? [],
+      validCodes: effectiveValidCodes[varName] ?? validCodes ?? [],
       valueLabels: sv?.valueLabels ?? dq?.codeLabels ?? {},
-      nFilled,
-      nEmpty,
       nIssues: colIssueCount[varName] ?? 0,
       issueTypes: [...(colIssueTypes[varName] ?? [])],
-      topValues,
       gatingRules,
       condRules,
       hasInDocx: !!dq,
       hasInSav: !!sv,
+      isScale,
+      scaleRange: isScale && scaleArr ? [scaleArr[0], scaleArr[scaleArr.length - 1]] : undefined,
     });
   }
 
@@ -915,15 +981,14 @@ interface ColumnSummary {
   type: string;
   validCodes: number[];
   valueLabels: Record<number, string>;
-  nFilled: number;
-  nEmpty: number;
   nIssues: number;
   issueTypes: IssueType[];
-  topValues: { val: string; cnt: number; label: string }[];
   gatingRules: RoutingRule[];
   condRules: RoutingRule[];
   hasInDocx: boolean;
   hasInSav: boolean;
+  isScale: boolean;
+  scaleRange?: [number, number];
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1000,21 +1065,18 @@ function ColumnPanel({ col, colIssues, onClose }: { col: ColumnSummary; colIssue
       </div>
 
       {/* Source badges */}
-      <div style={{ display: "flex", gap: 6, marginBottom: 14 }}>
+      <div style={{ display: "flex", gap: 6, marginBottom: 14, flexWrap: "wrap" }}>
         {col.hasInSav && <span style={{ background: "#fef9c3", border: "1px solid #fde047", borderRadius: 4, fontSize: 10, padding: "2px 7px", color: "#854d0e" }}>🗃 SAV-defined</span>}
         {col.hasInDocx && <span style={{ background: "#f0fdf4", border: "1px solid #86efac", borderRadius: 4, fontSize: 10, padding: "2px 7px", color: "#166534" }}>📝 Docx-defined</span>}
         <span style={{ background: "#f1f5f9", border: "1px solid #e2e8f0", borderRadius: 4, fontSize: 10, padding: "2px 7px", color: "#475569" }}>{col.type}</span>
+        {col.isScale && col.scaleRange && <span style={{ background: "#fdf4ff", border: "1px solid #e9d5ff", borderRadius: 4, fontSize: 10, padding: "2px 7px", color: "#7c3aed" }}>📏 Scale {col.scaleRange[0]}–{col.scaleRange[1]}</span>}
       </div>
 
-      {/* Fill stats */}
-      <div style={{ background: "#f8fafc", borderRadius: 8, padding: "10px 12px", marginBottom: 14, display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 8 }}>
+      {/* Stats */}
+      <div style={{ background: "#f8fafc", borderRadius: 8, padding: "10px 12px", marginBottom: 14, display: "grid", gridTemplateColumns: "1fr 1fr", gap: 8 }}>
         <div style={{ textAlign: "center" }}>
-          <div style={{ fontSize: 20, fontWeight: 800, color: "#1e293b" }}>{col.nFilled + col.nEmpty}</div>
-          <div style={{ fontSize: 10, color: "#64748b" }}>Total rows</div>
-        </div>
-        <div style={{ textAlign: "center" }}>
-          <div style={{ fontSize: 20, fontWeight: 800, color: "#16a34a" }}>{col.nFilled}</div>
-          <div style={{ fontSize: 10, color: "#64748b" }}>Filled</div>
+          <div style={{ fontSize: 20, fontWeight: 800, color: "#1e293b" }}>{col.validCodes.length}</div>
+          <div style={{ fontSize: 10, color: "#64748b" }}>Valid codes</div>
         </div>
         <div style={{ textAlign: "center" }}>
           <div style={{ fontSize: 20, fontWeight: 800, color: col.nIssues > 0 ? "#ef4444" : "#22c55e" }}>{col.nIssues}</div>
@@ -1046,25 +1108,7 @@ function ColumnPanel({ col, colIssues, onClose }: { col: ColumnSummary; colIssue
         </div>
       )}
 
-      {/* Value distribution */}
-      {col.topValues.length > 0 && (
-        <div style={{ marginBottom: 14 }}>
-          <div style={{ fontSize: 11, fontWeight: 700, color: "#64748b", marginBottom: 6 }}>VALUE DISTRIBUTION</div>
-          <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 11 }}>
-            <thead><tr><Th>Value</Th><Th>Label</Th><Th>Count</Th><Th>%</Th></tr></thead>
-            <tbody>
-              {col.topValues.map(({ val, cnt, label }) => (
-                <tr key={val}>
-                  <Td><code>{val}</code></Td>
-                  <Td style={{ color: "#64748b" }}>{label || "—"}</Td>
-                  <Td>{cnt}</Td>
-                  <Td style={{ color: "#94a3b8" }}>{((cnt / (col.nFilled || 1)) * 100).toFixed(1)}%</Td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        </div>
-      )}
+
 
       {/* Routing rules that gate this variable */}
       {col.gatingRules.length > 0 && (
@@ -1127,9 +1171,6 @@ function ColumnPanel({ col, colIssues, onClose }: { col: ColumnSummary; colIssue
 // ─────────────────────────────────────────────────────────────────────────────
 
 export default function App() {
-  // Data
-  const [data, setData] = useState<RowData[]>([]);
-  const [dataFileName, setDataFileName] = useState("");
 
   // SAV
   const [savVars, setSavVars] = useState<SavVariable[]>([]);
@@ -1160,29 +1201,6 @@ export default function App() {
 
   // ── File loaders ───────────────────────────────────────────────────────
 
-  const loadDataFile = useCallback((file: File) => {
-    setError("");
-    const ext = file.name.split(".").pop()?.toLowerCase() ?? "";
-    if (ext === "csv") {
-      Papa.parse<RowData>(file, {
-        header: true, skipEmptyLines: true, dynamicTyping: true,
-        complete: r => { setData(r.data); setDataFileName(file.name); },
-        error: (e: Error) => setError("CSV parse error: " + e.message),
-      });
-    } else if (ext === "xlsx" || ext === "xls") {
-      const reader = new FileReader();
-      reader.onload = e => {
-        try {
-          const wb = XLSX.read(e.target?.result as ArrayBuffer, { type: "array" });
-          setData(XLSX.utils.sheet_to_json<RowData>(wb.Sheets[wb.SheetNames[0]], { defval: "" }));
-          setDataFileName(file.name);
-        } catch (err) { setError("Excel parse error: " + (err as Error).message); }
-      };
-      reader.readAsArrayBuffer(file);
-    } else {
-      setError(`Unsupported file: .${ext}`);
-    }
-  }, []);
 
   const loadSavFile = useCallback((file: File) => {
     setError("");
@@ -1213,11 +1231,14 @@ export default function App() {
   // ── Analyze ────────────────────────────────────────────────────────────
 
   const analyze = () => {
-    if (!data.length) { setError("Upload a CSV or Excel data file to run validation."); return; }
+    if (savVars.length === 0 && Object.keys(docxQMap).length === 0) {
+      setError("Upload at least one file (SAV or DOCX) to run validation.");
+      return;
+    }
     setLoading(true); setError("");
     setTimeout(() => {
       const { issues: found, datasetWarnings: warnings, columnSummary: colSummary } =
-        runDynamicValidation(data, savVars, savVarMap, docxQMap, routingRules);
+        runStructuralValidation(savVars, savVarMap, docxQMap, routingRules);
       setIssues(found);
       setDsWarnings(warnings);
       setColumnSummary(colSummary);
@@ -1233,8 +1254,6 @@ export default function App() {
     acc[t] = issues.filter(i => i.type === t).length; return acc;
   }, {} as Record<IssueType, number>);
 
-  const issueMap: Record<string, IssueType> = {};
-  issues.forEach(i => { issueMap[`${i.id}__${i.variable}`] = i.type; });
 
   const filteredIssues = issues.filter(i => {
     const q = search.toLowerCase();
@@ -1253,13 +1272,19 @@ export default function App() {
     return matchSearch && matchFilter;
   });
 
-  const dataColumns = data.length ? Object.keys(data[0]) : [];
   const totalIssues = issues.length + dsWarnings.length;
 
   const downloadCSV = (rows: object[], name: string) => {
-    const csv = Papa.unparse(rows);
+    if (rows.length === 0) return;
+    const keys = Object.keys(rows[0]);
+    const escape = (v: string) => v.includes(",") || v.includes('"') || v.includes("\n")
+      ? '"' + v.replace(/"/g, '""') + '"' : v;
+    const lines = [keys.join(",")];
+    for (const row of rows) {
+      lines.push(keys.map(k => escape(String((row as Record<string, unknown>)[k] ?? ""))).join(","));
+    }
     const a = document.createElement("a");
-    a.href = URL.createObjectURL(new Blob([csv], { type: "text/csv" }));
+    a.href = URL.createObjectURL(new Blob([lines.join("\n")], { type: "text/csv" }));
     a.download = name; a.click();
   };
 
@@ -1270,7 +1295,6 @@ export default function App() {
   const tabs = [
     analyzed && ["columns", `📊 Columns (${columnSummary.length})`],
     analyzed && totalIssues > 0 && ["issues", `🚩 Issues (${totalIssues})`],
-    analyzed && data.length > 0 && ["data", `📋 Data Table`],
     savVars.length > 0 && ["savvars", `🗃 SAV (${savVars.length})`],
     nDocxRouting > 0 && ["routing", `📋 Routing (${nDocxRouting})`],
     docxRawText && ["docxtext", `📄 Questionnaire`],
@@ -1291,7 +1315,6 @@ export default function App() {
           <div style={{ fontSize: 11, opacity: .7, textAlign: "right", lineHeight: 1.8 }}>
             {savFileName && <div>🗃 {savFileName} · {savVars.length} vars, {nSavLabels} with codes</div>}
             {docxFileName && <div>📝 {docxFileName} · {nDocxQ} questions · {nDocxRouting} routing rules</div>}
-            {dataFileName && <div>📋 {dataFileName} · {data.length} rows · {dataColumns.length} cols</div>}
           </div>
         </div>
       </div>
@@ -1299,7 +1322,7 @@ export default function App() {
       <div style={{ maxWidth: 1300, margin: "0 auto", padding: "18px 16px" }}>
 
         {/* Upload zones */}
-        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr 1fr", gap: 10, marginBottom: 12 }}>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr 1fr", gap: 10, marginBottom: 12 }}>
 
           <div>
             <div style={{ fontSize: 10, fontWeight: 700, color: "#64748b", marginBottom: 5, textTransform: "uppercase", letterSpacing: .5 }}>
@@ -1317,21 +1340,14 @@ export default function App() {
             {nDocxRouting > 0 && <div style={{ marginTop: 3, fontSize: 10, color: "#7c3aed", background: "#f5f3ff", border: "1px solid #ddd6fe", borderRadius: 4, padding: "3px 7px" }}>✅ {nDocxRouting} routing rules · {nDocxQ} questions</div>}
           </div>
 
-          <div>
-            <div style={{ fontSize: 10, fontWeight: 700, color: "#64748b", marginBottom: 5, textTransform: "uppercase", letterSpacing: .5 }}>
-              3 · Data file <span style={{ color: "#ef4444" }}>*required</span>
-            </div>
-            <FileZone label="Drop CSV or Excel" sub=".csv · .xlsx — row-level data" onLoad={loadDataFile} loaded={dataFileName} accept=".csv,.xlsx,.xls" />
-          </div>
-
           <div style={{ display: "flex", flexDirection: "column", justifyContent: "flex-end" }}>
-            <button onClick={analyze} disabled={loading || !data.length}
-              style={{ padding: "13px", background: loading ? "#94a3b8" : !data.length ? "#cbd5e1" : "#2563eb", color: "#fff", border: "none", borderRadius: 10, fontSize: 13, fontWeight: 700, cursor: data.length ? "pointer" : "not-allowed", width: "100%", marginBottom: 6 }}>
+            <button onClick={analyze} disabled={loading || (savVars.length === 0 && Object.keys(docxQMap).length === 0)}
+              style={{ padding: "13px", background: loading ? "#94a3b8" : (savVars.length === 0 && Object.keys(docxQMap).length === 0) ? "#cbd5e1" : "#2563eb", color: "#fff", border: "none", borderRadius: 10, fontSize: 13, fontWeight: 700, cursor: (savVars.length > 0 || Object.keys(docxQMap).length > 0) ? "pointer" : "not-allowed", width: "100%", marginBottom: 6 }}>
               {loading ? "⏳ Analyzing…" : "🚀 Run Validation"}
             </button>
             <div style={{ background: "#fffbeb", border: "1px solid #fde68a", borderRadius: 6, padding: "6px 10px", fontSize: 10, color: "#92400e" }}>
-              💡 SAV defines what's valid. Docx defines routing. CSV is the data to check.<br />
-              All rules are derived from your files — nothing is hardcoded.
+              💡 <strong>SAV is the primary authority</strong> — it defines valid codes, variable types, and value labels.<br />
+              Docx adds routing/skip logic and question labels. Validation compares SAV codes against DOCX structure.
             </div>
           </div>
         </div>
@@ -1345,7 +1361,7 @@ export default function App() {
             {nSavLabels > 0 && <span>🗃 {nSavLabels} SAV variables with valid codes loaded</span>}
             {nDocxRouting > 0 && <span>📋 {nDocxRouting} routing rules from docx</span>}
             {nDocxQ > 0 && <span>📝 {nDocxQ} question labels from docx</span>}
-            <span style={{ opacity: .7 }}>→ Upload data file and click Run Validation</span>
+            <span style={{ opacity: .7 }}>→ Click Run Validation to compare SAV and DOCX</span>
           </div>
         )}
 
@@ -1407,8 +1423,7 @@ export default function App() {
                           <Th>Variable</Th>
                           <Th>Question / Label</Th>
                           <Th>Valid Codes (SAV)</Th>
-                          <Th style={{ textAlign: "center" }}>Filled</Th>
-                          <Th style={{ textAlign: "center" }}>Empty</Th>
+                          <Th style={{ textAlign: "center" }}>Codes</Th>
                           <Th style={{ textAlign: "center" }}>Issues</Th>
                           <Th>Issue Types</Th>
                           <Th>Source</Th>
@@ -1437,8 +1452,7 @@ export default function App() {
                                 </div>
                               ) : <span style={{ color: "#cbd5e1", fontSize: 10, fontStyle: "italic" }}>—</span>}
                             </Td>
-                            <Td style={{ textAlign: "center", color: "#16a34a", fontWeight: 600 }}>{col.nFilled}</Td>
-                            <Td style={{ textAlign: "center", color: col.nEmpty > 0 ? "#f97316" : "#94a3b8" }}>{col.nEmpty}</Td>
+                            <Td style={{ textAlign: "center", color: "#64748b" }}>{col.validCodes.length || "—"}</Td>
                             <Td style={{ textAlign: "center" }}>
                               {col.nIssues > 0
                                 ? <span style={{ background: "#fef2f2", color: "#ef4444", borderRadius: 12, padding: "2px 8px", fontWeight: 700, fontSize: 11 }}>{col.nIssues}</span>
@@ -1450,9 +1464,10 @@ export default function App() {
                               </div>
                             </Td>
                             <Td>
-                              <div style={{ display: "flex", gap: 3 }}>
+                              <div style={{ display: "flex", gap: 3, flexWrap: "wrap" }}>
                                 {col.hasInSav && <span style={{ fontSize: 9, background: "#fef9c3", border: "1px solid #fde047", borderRadius: 3, padding: "1px 4px", color: "#854d0e" }}>SAV</span>}
                                 {col.hasInDocx && <span style={{ fontSize: 9, background: "#f0fdf4", border: "1px solid #86efac", borderRadius: 3, padding: "1px 4px", color: "#166534" }}>DOCX</span>}
+                                {col.isScale && col.scaleRange && <span style={{ fontSize: 9, background: "#fdf4ff", border: "1px solid #e9d5ff", borderRadius: 3, padding: "1px 4px", color: "#7c3aed" }}>{col.scaleRange[0]}–{col.scaleRange[1]}</span>}
                               </div>
                             </Td>
                           </tr>
@@ -1519,34 +1534,6 @@ export default function App() {
             )}
 
             {/* ── Data table tab ── */}
-            {tab === "data" && (
-              <div style={{ background: "#fff", borderRadius: 10, border: "1px solid #e2e8f0", overflow: "auto", maxHeight: 560 }}>
-                <table style={{ width: "100%", borderCollapse: "collapse", fontSize: 10 }}>
-                  <thead style={{ position: "sticky", top: 0, background: "#f8fafc", zIndex: 1 }}>
-                    <tr>{dataColumns.map(col => <Th key={col}>{col}</Th>)}</tr>
-                  </thead>
-                  <tbody>
-                    {data.slice(0, 200).map((row, ri) => {
-                      const rid = (["id","ID","Id","RespondentID"].find(k => row[k] != null) ? row[["id","ID","Id","RespondentID"].find(k => row[k] != null)!] : `Row${ri+1}`);
-                      return (
-                        <tr key={ri} style={{ background: ri % 2 === 0 ? "#fff" : "#fafafa" }}>
-                          {dataColumns.map(col => {
-                            const it = issueMap[`${rid}__${col}`];
-                            const meta = it ? ISSUE_TYPES[it] : null;
-                            return (
-                              <td key={col} title={meta ? `${meta.label}: ${issues.find(iss => iss.id == rid && iss.variable === col)?.detail}` : ""}
-                                style={{ padding: "4px 8px", background: meta ? meta.bg : "transparent", color: meta ? meta.color : "#334155", fontFamily: "monospace", fontSize: 10, borderBottom: "1px solid #f1f5f9", whiteSpace: "nowrap" }}>
-                                {String(row[col] ?? "").slice(0, 35)}
-                              </td>
-                            );
-                          })}
-                        </tr>
-                      );
-                    })}
-                  </tbody>
-                </table>
-              </div>
-            )}
 
             {/* ── SAV vars tab ── */}
             {tab === "savvars" && (
@@ -1639,7 +1626,6 @@ export default function App() {
               <strong>This validator is fully dynamic — it learns from your files:</strong><br />
               🗃 <strong>.sav</strong> → defines which codes are valid for each variable (primary authority)<br />
               📝 <strong>.docx</strong> → defines routing logic, skip conditions, question labels<br />
-              📋 <strong>.csv/.xlsx</strong> → the actual data to validate against the above<br /><br />
               No survey-specific rules are hardcoded. Upload any questionnaire dataset.
             </div>
           </div>
