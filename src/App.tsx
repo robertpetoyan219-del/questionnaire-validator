@@ -126,6 +126,7 @@ function parseSavFile(buffer: ArrayBuffer): {
 
   const variables: SavVariable[] = [];
   const varBySlot: (SavVariable | null)[] = [];
+  const longVarNames: Record<string, string> = {}; // subtype-14 long name map
   let slot = 0;
   let offset = 176; // after 176-byte header
   const maxOff = buffer.byteLength - 4;
@@ -220,16 +221,41 @@ function parseSavFile(buffer: ArrayBuffer): {
       offset += nLines * 80;
 
     } else if (recType === 7) {
-      // Info/extension record — skip
-      if (offset + 8 > buffer.byteLength) break;
-      const elemSize = readI32s(offset + 4); offset += 8;
-      if (offset + 4 > buffer.byteLength) break;
-      const nElems = readI32s(offset); offset += 4;
+      // Info/extension record
+      if (offset + 12 > buffer.byteLength) break;
+      const subtype  = readI32s(offset);     offset += 4;
+      const elemSize = readI32s(offset);     offset += 4;
+      const nElems   = readI32s(offset);     offset += 4;
+      if (subtype === 14) {
+        // Long variable names: tab-separated "SHORTNAM=LONGNAME" pairs
+        // LimeSurvey exports store string WIDTH (e.g. "500") as the "long name" — detect and ignore those
+        const block = bytes.slice(offset, offset + elemSize * nElems);
+        let text = "";
+        try { text = new TextDecoder("utf-8", { fatal: true }).decode(block); }
+        catch { text = new TextDecoder("latin1").decode(block); }
+        for (const pair of text.replace(/\0/g, "").split("\t")) {
+          const eq = pair.indexOf("=");
+          if (eq > 0) {
+            const shortN = pair.slice(0, eq).trim();
+            const longN  = pair.slice(eq + 1).trim();
+            // Skip if longN is a pure number (LimeSurvey string-width artefact like "500")
+            if (shortN && longN && !/^\d+$/.test(longN)) {
+              longVarNames[shortN] = longN;
+            }
+          }
+        }
+      }
       offset += elemSize * nElems;
 
     } else {
       break; // Unknown record type
     }
+  }
+
+  // Apply long variable names from Type 7 / subtype 14
+  // (must run before varMap build so that the long names are used as keys)
+  for (const sv of variables) {
+    if (longVarNames[sv.name]) sv.name = longVarNames[sv.name];
   }
 
   // Build validCodes from valueLabels (exclude system-missing 1.7976931348623157e+308)
@@ -461,6 +487,9 @@ async function parseDocxFile(buffer: ArrayBuffer): Promise<{
   }
 
   // ── Per-line processing ───────────────────────────────────────────────────
+  // pendingGateRules: holds the most recently parsed routing rules so that
+  // the next question line can be registered as their target.
+  let pendingGateRules: RoutingRule[] = [];
 
   for (const line of lines) {
 
@@ -468,6 +497,7 @@ async function parseDocxFile(buffer: ArrayBuffer): Promise<{
     if (SECTION_RE.test(line)) {
       currentSection = line.replace(/^=+|=+$/g, "").trim().slice(0, 80);
       currentQ = null;
+      pendingGateRules = []; // new section resets routing context
       continue;
     }
 
@@ -485,10 +515,17 @@ async function parseDocxFile(buffer: ArrayBuffer): Promise<{
       continue;
     }
 
-    // 3. Routing lines (standalone "Ask if …" / "End if …")
+    // 3. Routing lines (standalone "Ask if …" / "End if …" / "Ask all")
     if (ROUTING_LINE_RE.test(line)) {
-      const parsed = parseRoutingLine(line);
-      routingRules.push(...parsed);
+      if (/ASK\s+ALL|Ask\s+all/i.test(line)) {
+        // No condition — clear any pending gate so the next question is unrestricted
+        pendingGateRules = [];
+      } else {
+        const parsed = parseRoutingLine(line);
+        routingRules.push(...parsed);
+        // Save parsed rules so the next question line can be registered as their target
+        pendingGateRules = parsed;
+      }
       // Don't set currentQ — routing line is a filter, not a question
       continue;
     }
@@ -571,6 +608,14 @@ async function parseDocxFile(buffer: ArrayBuffer): Promise<{
         // Update section/label if we see it again with more context
         currentQ = questionMap[code];
       }
+
+      // ── Link pending gate rules: this question is a target of the last routing line ──
+      // pendingGateRules holds the rule(s) parsed from the "ASK IF …" line immediately
+      // preceding this question (possibly with format lines like "Single response" in between).
+      for (const rule of pendingGateRules) {
+        if (!rule.targets.includes(code)) rule.targets.push(code);
+      }
+      pendingGateRules = []; // consumed — reset for the next question
       continue;
     }
 
@@ -927,6 +972,54 @@ function runStructuralValidation(
           detail: `Routing rule targets unknown variable "${target}"`,
           explanation: `Rule: "${rule.rawText}"\nThe target variable "${target}" is not found in either SAV or DOCX.`,
         });
+      }
+    }
+  }
+
+  // ── A10 conditional check ─────────────────────────────────────────────────
+  // A10 is ONLY asked when the respondent rated at least one of the four key
+  // banks (Acba/Ameria/Ardshin/Ineco — slots 1, 2, 8, 15 in A9) as 4 or 5.
+  // This cannot be expressed as a simple routing rule because the condition in
+  // the docx uses complex bracket notation; we enforce it as a special check.
+  {
+    const A10_SLOTS = ["A10_1","A10_2","A10_8","A10_15"];
+    const A9_CTRL   = ["A9_1","A9_2","A9_8","A9_15"];
+    const a10Present = A10_SLOTS.filter(v => dataColumns.has(v));
+    const a9Present  = A9_CTRL.filter(v => dataColumns.has(v));
+
+    if (a10Present.length > 0 && a9Present.length > 0) {
+      for (const row of data) {
+        const rid = (idKey ? row[idKey] : null) ?? row.id ?? row.ID ?? "?";
+        // Is the overall A10 condition satisfied (any control-bank A9 score ≥ 4)?
+        const anyHighRated = a9Present.some(k => { const v = getNum(row, k); return v !== null && v >= 4; });
+
+        for (const a10v of a10Present) {
+          const slot = a10v.replace("A10_", ""); // "1", "2", "8", "15"
+          const a9k  = `A9_${slot}`;
+
+          if (hasVal(row, a10v) && !anyHighRated) {
+            // Filled but no bank met the threshold — skip violation
+            flagColTracked(rid, a10v, "SKIP_VIOLATION", getNum(row, a10v),
+              `${a10v} filled — A10 condition not met (no control bank rated 4-5 in A9)`,
+              `A10 is only asked when at least one of Acba/Ameria/Ardshin/Ineco is rated 4 or 5 in A9.\n` +
+              `This respondent has no such rating, so ${a10v} should be empty.\n` +
+              `A9 control slot values: ${a9Present.map(k => `${k}=${getNum(row, k) ?? "—"}`).join(", ")}`
+            );
+          }
+
+          if (!hasVal(row, a10v) && dataColumns.has(a9k)) {
+            // If THIS slot's A9 score is 4 or 5, the A10 sub-question for that bank is required
+            const a9val = getNum(row, a9k);
+            if (a9val !== null && a9val >= 4) {
+              flagColTracked(rid, a10v, "MISSING_DATA", null,
+                `${a10v} missing — ${a9k}=${a9val} (≥ 4, so A10 for this bank should be answered)`,
+                `A10 asks the reason why a respondent would consider a bank as their employer.\n` +
+                `${a9k}=${a9val} (rated ≥ 4), so ${a10v} must be filled.\n` +
+                `Note: if the bank is the respondent's current employer (D31=matching code), skip is valid.`
+              );
+            }
+          }
+        }
       }
     }
   }
