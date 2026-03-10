@@ -817,11 +817,25 @@ function runStructuralValidation(
 
   // ── Structural check 1: SAV variables not in DOCX ─────────────────────
   const docxCodes = new Set(Object.keys(docxQMap));
+  // Build set of SAV variable names for multi-response lookup
+  // Helper: does SAV have any {base}_{suffix} variables for a given DOCX question?
+  const hasMultiResponseExpansion = (docxCode: string) =>
+    savVars.some(sv => {
+      const m = sv.name.match(/^(.+?)_(\d+)$/);
+      return m && m[1] === docxCode;
+    });
+  // Helper: is this SAV variable a multi-response expansion of a DOCX question?
+  const isMultiResponseVar = (savName: string) => {
+    const m = savName.match(/^(.+?)_(\d+)$/);
+    return m ? docxCodes.has(m[1]) : false;
+  };
+
   if (docxCodes.size > 0) {
     const savNotInDocx = savVars.filter(sv =>
       sv.type === "numeric" &&
       sv.validCodes.length > 0 &&
-      !docxCodes.has(sv.name)
+      !docxCodes.has(sv.name) &&
+      !isMultiResponseVar(sv.name)
     );
     for (const sv of savNotInDocx.slice(0, 15)) {
       datasetWarnings.push({
@@ -845,7 +859,8 @@ function runStructuralValidation(
   if (savVars.length > 0) {
     const docxNotInSav = Object.values(docxQMap).filter(dq =>
       !savVarMap[dq.code] &&
-      dq.validCodes.length > 0
+      dq.validCodes.length > 0 &&
+      !hasMultiResponseExpansion(dq.code)
     );
     for (const dq of docxNotInSav.slice(0, 15)) {
       datasetWarnings.push({
