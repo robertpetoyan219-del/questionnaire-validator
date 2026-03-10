@@ -108,6 +108,7 @@ function smartDecode(bytes: Uint8Array, start: number, len: number): string {
 function parseSavFile(buffer: ArrayBuffer): {
   variables: SavVariable[];
   varMap: Record<string, SavVariable>;
+  rows: Record<string, number | string | null>[];
 } {
   const bytes = new Uint8Array(buffer);
 
@@ -120,9 +121,13 @@ function parseSavFile(buffer: ArrayBuffer): {
   // Verify SAV magic "$FL2" or "$FL3"
   const magic = readStr(0, 4);
   if (!magic.startsWith("$FL")) {
-    // fallback: legacy ASCII scan
-    return legacySavScan(buffer);
+    return { ...legacySavScan(buffer), rows: [] };
   }
+
+  // Read fixed header fields (176-byte header, no leading record-type int)
+  const nominalCaseSize = readI32s(64); // number of 8-byte slots per case
+  const compressionCode = readI32s(68); // 0=uncompressed, 1=byte-code, 2=ZLIB
+  const bias            = readF64(80);  // compression bias (usually 100.0)
 
   const variables: SavVariable[] = [];
   const varBySlot: (SavVariable | null)[] = [];
@@ -232,6 +237,9 @@ function parseSavFile(buffer: ArrayBuffer): {
     }
   }
 
+  // Data starts 4 bytes after the 999 record (the 4-byte zero filler)
+  const dataOffset = offset + 4;
+
   // Build validCodes from valueLabels (exclude system-missing 1.7976931348623157e+308)
   const SYSMIS = 1.7976931348623157e+308;
   for (const sv of variables) {
@@ -244,11 +252,116 @@ function parseSavFile(buffer: ArrayBuffer): {
   const varMap: Record<string, SavVariable> = {};
   for (const sv of variables) varMap[sv.name] = sv;
 
-  if (variables.length === 0) return legacySavScan(buffer);
-  return { variables, varMap };
+  if (variables.length === 0) return { ...legacySavScan(buffer), rows: [] };
+
+  // Parse actual data rows from the SAV file
+  const numSlots = nominalCaseSize > 0 ? nominalCaseSize : varBySlot.length;
+  const rows = parseSavRows(buffer, bytes, dataOffset, varBySlot, numSlots, compressionCode, bias);
+
+  return { variables, varMap, rows };
 }
 
-function legacySavScan(buffer: ArrayBuffer): { variables: SavVariable[]; varMap: Record<string, SavVariable> } {
+// ── SAV data row parser ────────────────────────────────────────────────────────
+// Supports byte-code compressed (type 1) and uncompressed (type 0) SAV files.
+// ZLIB-compressed files (type 2) are not supported in the browser.
+function parseSavRows(
+  buffer: ArrayBuffer,
+  bytes: Uint8Array,
+  dataOffset: number,
+  varBySlot: (SavVariable | null)[],
+  numSlots: number,
+  compressionCode: number,
+  bias: number,
+): Record<string, number | string | null>[] {
+  const readF64 = (o: number) => new DataView(buffer, o, 8).getFloat64(0, true);
+  const SYSMIS = 1.7976931348623157e+308;
+  const MAX_ROWS = 5000;
+  const rows: Record<string, number | string | null>[] = [];
+
+  if (dataOffset >= buffer.byteLength || numSlots <= 0) return rows;
+
+  if (compressionCode === 1) {
+    // Byte-code compressed: 8 opcode bytes control 8 value slots at a time.
+    // opcodes 1-251 → value = op - bias (no extra bytes)
+    // opcode 253   → next 8 bytes in file are the raw IEEE-754 value
+    // opcode 254   → blank string (8 spaces)
+    // opcode 255   → system missing
+    // opcode 252   → end of file
+    let pos = dataOffset;
+    let caseSlot = 0;
+    let currentRow: Record<string, number | string | null> = {};
+    const opcodes: number[] = new Array(8);
+    let opcodeIdx = 8; // trigger refill on first use
+
+    while (pos < buffer.byteLength && rows.length < MAX_ROWS) {
+      if (opcodeIdx >= 8) {
+        if (pos + 8 > buffer.byteLength) break;
+        for (let i = 0; i < 8; i++) opcodes[i] = bytes[pos + i];
+        pos += 8;
+        opcodeIdx = 0;
+      }
+
+      const op = opcodes[opcodeIdx++];
+      if (op === 252) break; // EOF
+
+      const sv = varBySlot[caseSlot];
+      let value: number | string | null = null;
+
+      if (op >= 1 && op <= 251) {
+        value = op - bias;
+      } else if (op === 253) {
+        if (pos + 8 > buffer.byteLength) break;
+        const raw = readF64(pos); pos += 8;
+        if (sv?.type === "string") {
+          value = smartDecode(bytes, pos - 8, 8).trimEnd();
+        } else {
+          value = (raw >= SYSMIS || isNaN(raw)) ? null : raw;
+        }
+      } else if (op === 254) {
+        value = sv?.type === "string" ? "" : null;
+      } else {
+        // 0 (undefined) or 255 (system missing) → null
+        value = null;
+      }
+
+      if (sv) currentRow[sv.name] = value;
+      caseSlot++;
+
+      if (caseSlot >= numSlots) {
+        rows.push(currentRow);
+        currentRow = {};
+        caseSlot = 0;
+      }
+    }
+    // Push any partial last row
+    if (caseSlot > 0 && Object.keys(currentRow).length > 0) rows.push(currentRow);
+
+  } else if (compressionCode === 0) {
+    // Uncompressed: each value is a raw 8-byte block
+    let pos = dataOffset;
+    while (pos + numSlots * 8 <= buffer.byteLength && rows.length < MAX_ROWS) {
+      const row: Record<string, number | string | null> = {};
+      for (let i = 0; i < numSlots; i++) {
+        const sv = varBySlot[i];
+        if (sv) {
+          if (sv.type === "string") {
+            row[sv.name] = smartDecode(bytes, pos + i * 8, 8).trimEnd();
+          } else {
+            const val = readF64(pos + i * 8);
+            row[sv.name] = (val >= SYSMIS || isNaN(val)) ? null : val;
+          }
+        }
+      }
+      rows.push(row);
+      pos += numSlots * 8;
+    }
+  }
+  // compressionCode === 2 (ZLIB) requires pako — not supported in browser without dependency
+
+  return rows;
+}
+
+function legacySavScan(buffer: ArrayBuffer): { variables: SavVariable[]; varMap: Record<string, SavVariable>; rows: Record<string, number | string | null>[] } {
   const bytes = new Uint8Array(buffer);
   const SKIP = new Set(["the","and","or","in","of","to","is","for","with","from","not","are","at","by",
     "this","that","be","as","it","on","if","do","so","SPSS","DATA","LIST","SAVE","GET","COMPUTE",
@@ -271,7 +384,7 @@ function legacySavScan(buffer: ArrayBuffer): { variables: SavVariable[]; varMap:
   }
   const varMap: Record<string, SavVariable> = {};
   for (const sv of variables) varMap[sv.name] = sv;
-  return { variables, varMap };
+  return { variables, varMap, rows: [] };
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -767,6 +880,193 @@ function findGatingRules(
   return rules.filter(r => r.targets.includes(varName) || r.skipTargets.includes(varName));
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// DATA VALIDATION (row-level)
+// Validates actual respondent data: routing violations, open-text quality,
+// and company-repeat follow-up checks (e.g. A9_N high → A10_N must be filled).
+// ─────────────────────────────────────────────────────────────────────────────
+function runDataValidation(
+  rows: Record<string, number | string | null>[],
+  savVarMap: Record<string, SavVariable>,
+  routingRules: RoutingRule[],
+): { issues: Issue[]; datasetWarnings: DatasetWarning[] } {
+  const issues: Issue[] = [];
+  const datasetWarnings: DatasetWarning[] = [];
+
+  if (rows.length === 0) return { issues, datasetWarnings };
+
+  const SYSMIS_THRESHOLD = 1e15;
+
+  const isEmpty = (v: number | string | null | undefined): boolean => {
+    if (v === null || v === undefined) return true;
+    if (typeof v === "number" && (isNaN(v) || v > SYSMIS_THRESHOLD)) return true;
+    if (typeof v === "string" && v.trim() === "") return true;
+    return false;
+  };
+
+  const getNum = (row: Record<string, number | string | null>, name: string): number | null => {
+    const v = row[name];
+    if (typeof v === "number" && !isNaN(v) && v < SYSMIS_THRESHOLD) return v;
+    return null;
+  };
+
+  const evalCond = (row: Record<string, number | string | null>, rule: RoutingRule): boolean => {
+    const val = getNum(row, rule.condVar);
+    if (val === null) return false;
+    switch (rule.condOp) {
+      case "=":  return rule.condVals.includes(val);
+      case "!=": return !rule.condVals.includes(val);
+      case ">":  return rule.condVals.length > 0 && val > rule.condVals[0];
+      case "<":  return rule.condVals.length > 0 && val < rule.condVals[0];
+      case ">=": return rule.condVals.length > 0 && val >= rule.condVals[0];
+      case "<=": return rule.condVals.length > 0 && val <= rule.condVals[0];
+      default:   return false;
+    }
+  };
+
+  // ── Check 1: Company-repeat follow-up pattern ──────────────────────────────
+  // Detects pairs like A9_N (rating 1-5) → A10_N (open text).
+  // If A9_N is at the top of its scale (e.g. 4 or 5 on a 1-5 scale),
+  // the corresponding open-text follow-up variable should not be empty.
+  const savNames = new Set(Object.keys(savVarMap));
+
+  // Group variables by base: A9_1, A9_2 → base "A9", suffixes [1, 2]
+  const baseGroups = new Map<string, Set<number>>();
+  for (const name of savNames) {
+    const m = name.match(/^(.+?)_(\d+)$/);
+    if (m) {
+      const base = m[1], n = parseInt(m[2]);
+      if (!baseGroups.has(base)) baseGroups.set(base, new Set());
+      baseGroups.get(base)!.add(n);
+    }
+  }
+
+  // For each rating-scale base group, find string follow-up groups with overlapping N values
+  for (const [ratingBase, ratingSlots] of baseGroups) {
+    // The rating variable must be numeric with a clear scale (e.g. 1-5)
+    const exampleRatingSv = savVarMap[`${ratingBase}_${[...ratingSlots][0]}`];
+    if (!exampleRatingSv || exampleRatingSv.type !== "numeric") continue;
+    const codes = exampleRatingSv.validCodes;
+    if (codes.length < 3 || codes[0] !== 1 || codes[codes.length - 1] < 4) continue;
+
+    const scaleMax = codes.filter(c => c <= 10).at(-1) ?? codes[codes.length - 1];
+    const threshold = scaleMax - 1; // top 2 values trigger the follow-up (e.g. 4 or 5 on 1-5)
+
+    for (const [followBase, followSlots] of baseGroups) {
+      if (followBase === ratingBase) continue;
+      const exampleFollowSv = savVarMap[`${followBase}_${[...followSlots][0]}`];
+      if (!exampleFollowSv || exampleFollowSv.type !== "string") continue;
+
+      const sharedSlots = [...ratingSlots].filter(n => followSlots.has(n));
+      if (sharedSlots.length === 0) continue;
+
+      // Count violations per (ratingVar→followVar) pair, cap per pair to avoid flooding
+      const pairCounts = new Map<string, number>();
+      const MAX_PER_PAIR = 3;
+
+      rows.forEach((row, rowIdx) => {
+        for (const n of sharedSlots) {
+          const ratingVar = `${ratingBase}_${n}`;
+          const followVar = `${followBase}_${n}`;
+          const ratingVal = getNum(row, ratingVar);
+          if (ratingVal === null || ratingVal < threshold) continue;
+          if (!isEmpty(row[followVar])) continue;
+
+          const pairKey = `${ratingVar}→${followVar}`;
+          const count = (pairCounts.get(pairKey) ?? 0) + 1;
+          pairCounts.set(pairKey, count);
+          if (count > MAX_PER_PAIR) continue;
+
+          const rSv = savVarMap[ratingVar];
+          const fSv = savVarMap[followVar];
+          issues.push({
+            id: rowIdx + 1,
+            variable: followVar,
+            type: "MISSING_DATA",
+            value: null,
+            detail: `Row ${rowIdx + 1}: ${followVar} empty — ${ratingVar}=${ratingVal} (≥${threshold}, follow-up required)`,
+            explanation: `${rSv?.label || ratingVar} = ${ratingVal} (top of scale ≥ ${threshold})\n→ Open-text follow-up "${fSv?.label || followVar}" should be answered but is empty.`,
+          });
+        }
+      });
+
+      // Summary warning for pairs with many violations
+      for (const [pairKey, count] of pairCounts) {
+        if (count > MAX_PER_PAIR) {
+          datasetWarnings.push({
+            type: "MISSING_DATA",
+            variable: pairKey.split("→")[1],
+            detail: `${pairKey}: ${count} rows where follow-up is empty (showing first ${MAX_PER_PAIR})`,
+            explanation: `${count} respondents rated high on ${pairKey.split("→")[0]} but left the open-text follow-up empty.`,
+          });
+        }
+      }
+    }
+  }
+
+  // ── Check 2: DOCX routing rule violations ─────────────────────────────────
+  const MAX_PER_VAR = 5;
+  const varViolationCount = new Map<string, number>();
+
+  rows.forEach((row, rowIdx) => {
+    for (const rule of routingRules) {
+      if (!(rule.condVar in row)) continue;
+      const condMet = evalCond(row, rule);
+
+      if (condMet) {
+        for (const target of rule.targets) {
+          if (target === "TERMINATE") continue;
+          if (!(target in row)) continue;
+          if (isEmpty(row[target])) {
+            const count = (varViolationCount.get(target) ?? 0) + 1;
+            varViolationCount.set(target, count);
+            if (count <= MAX_PER_VAR) {
+              issues.push({
+                id: rowIdx + 1,
+                variable: target,
+                type: "MISSING_DATA",
+                value: null,
+                detail: `Row ${rowIdx + 1}: ${target} missing — required when ${rule.condVar}${rule.condOp}${rule.condVals.join(",")}`,
+                explanation: `Rule: "${rule.rawText}"\n${rule.condVar}=${getNum(row, rule.condVar)} → condition met, but ${target} is empty.`,
+              });
+            }
+          }
+        }
+        for (const skip of rule.skipTargets) {
+          if (!(skip in row)) continue;
+          if (!isEmpty(row[skip])) {
+            const count = (varViolationCount.get(skip) ?? 0) + 1;
+            varViolationCount.set(skip, count);
+            if (count <= MAX_PER_VAR) {
+              issues.push({
+                id: rowIdx + 1,
+                variable: skip,
+                type: "SKIP_VIOLATION",
+                value: row[skip],
+                detail: `Row ${rowIdx + 1}: ${skip} filled but should be skipped when ${rule.condVar}${rule.condOp}${rule.condVals.join(",")}`,
+                explanation: `Rule: "${rule.rawText}"\nCondition met → ${skip} should be empty, but has value ${row[skip]}.`,
+              });
+            }
+          }
+        }
+      }
+    }
+  });
+
+  for (const [variable, count] of varViolationCount) {
+    if (count > MAX_PER_VAR) {
+      datasetWarnings.push({
+        type: "ROUTING",
+        variable,
+        detail: `${variable}: ${count} routing violations (first ${MAX_PER_VAR} shown)`,
+        explanation: `${count} rows violate a routing rule for ${variable}.`,
+      });
+    }
+  }
+
+  return { issues, datasetWarnings };
+}
+
 function runStructuralValidation(
   savVars: SavVariable[],
   savVarMap: Record<string, SavVariable>,
@@ -1190,6 +1490,7 @@ export default function App() {
   // SAV
   const [savVars, setSavVars] = useState<SavVariable[]>([]);
   const [savVarMap, setSavVarMap] = useState<Record<string, SavVariable>>({});
+  const [savRows, setSavRows] = useState<Record<string, number | string | null>[]>([]);
   const [savFileName, setSavFileName] = useState("");
 
   // Docx
@@ -1221,9 +1522,10 @@ export default function App() {
     setError("");
     const reader = new FileReader();
     reader.onload = e => {
-      const { variables, varMap } = parseSavFile(e.target?.result as ArrayBuffer);
+      const { variables, varMap, rows } = parseSavFile(e.target?.result as ArrayBuffer);
       setSavVars(variables);
       setSavVarMap(varMap);
+      setSavRows(rows);
       setSavFileName(file.name);
     };
     reader.readAsArrayBuffer(file);
@@ -1252,10 +1554,12 @@ export default function App() {
     }
     setLoading(true); setError("");
     setTimeout(() => {
-      const { issues: found, datasetWarnings: warnings, columnSummary: colSummary } =
+      const { issues: structIssues, datasetWarnings: structWarnings, columnSummary: colSummary } =
         runStructuralValidation(savVars, savVarMap, docxQMap, routingRules);
-      setIssues(found);
-      setDsWarnings(warnings);
+      const { issues: dataIssues, datasetWarnings: dataWarnings } =
+        runDataValidation(savRows, savVarMap, routingRules);
+      setIssues([...structIssues, ...dataIssues]);
+      setDsWarnings([...structWarnings, ...dataWarnings]);
       setColumnSummary(colSummary);
       setAnalyzed(true);
       setTab("columns");
