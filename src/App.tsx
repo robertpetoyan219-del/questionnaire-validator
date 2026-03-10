@@ -513,8 +513,11 @@ async function parseDocxFile(buffer: ArrayBuffer): Promise<{
   // Question line: VAR_CODE. Question text
   // Code must be ALL-CAPS start, contain at least one digit OR be a known alpha code (S0, B1, etc.)
   // Separators: . ․ (Armenian middle dot) : – — )
-  // The code must NOT be a pure number
-  const QUESTION_RE = /^([A-Z][A-Za-z0-9_.]{0,19})\s*[.․:–—)]\s*(.{2,})/;
+  // The code must NOT be a pure number.
+  // Dots are allowed INSIDE the code (e.g. D3.1) but NOT as a trailing character —
+  // otherwise "D3." would eat the separator dot and leave no separator for the regex.
+  // Pattern: base alphanum/underscore, optionally followed by ".digit+" extensions (D3.1, D3.11, etc.)
+  const QUESTION_RE = /^([A-Z][A-Za-z0-9_]*(?:\.\d+)*)\s*[.․:–—)]\s*(.{2,})/;
 
   // Words/phrases that look like question codes but are actually instructions
   const FAKE_CODE_WORDS = new Set([
@@ -889,6 +892,7 @@ function runDataValidation(
   rows: Record<string, number | string | null>[],
   savVarMap: Record<string, SavVariable>,
   routingRules: RoutingRule[],
+  docxQMap: Record<string, DocxQuestion>,
 ): { issues: Issue[]; datasetWarnings: DatasetWarning[] } {
   const issues: Issue[] = [];
   const datasetWarnings: DatasetWarning[] = [];
@@ -941,12 +945,44 @@ function runDataValidation(
     }
   }
 
+  // Resolve the valid codes for a base group:
+  // 1. From the SAV slot variable itself
+  // 2. From the parent SAV variable (e.g. A9 for A9_1) — labels often set only on parent
+  // 3. From the DOCX question for the same base
+  // 4. Inferred from the first 300 rows of data
+  const resolveScaleCodes = (base: string, slots: Set<number>): number[] => {
+    // Try SAV slot variable
+    const slotSv = savVarMap[`${base}_${[...slots][0]}`];
+    if (slotSv?.validCodes.length >= 3) return slotSv.validCodes;
+
+    // Try parent SAV variable (same base name, no suffix)
+    const parentSv = savVarMap[base];
+    if (parentSv?.validCodes.length >= 3) return parentSv.validCodes;
+
+    // Try DOCX question for this base
+    const dq = docxQMap[base];
+    if (dq?.validCodes.length >= 3) return dq.validCodes;
+
+    // Infer from data: collect distinct integer values for any slot variable
+    const seen = new Set<number>();
+    const sampleSlots = [...slots].slice(0, 3);
+    for (const row of rows.slice(0, 300)) {
+      for (const n of sampleSlots) {
+        const v = row[`${base}_${n}`];
+        if (typeof v === "number" && Number.isInteger(v) && v > 0 && v <= 20) seen.add(v);
+      }
+    }
+    if (seen.size >= 3) return [...seen].sort((a, b) => a - b);
+    return [];
+  };
+
   // For each rating-scale base group, find string follow-up groups with overlapping N values
   for (const [ratingBase, ratingSlots] of baseGroups) {
-    // The rating variable must be numeric with a clear scale (e.g. 1-5)
+    // The rating variable must be numeric
     const exampleRatingSv = savVarMap[`${ratingBase}_${[...ratingSlots][0]}`];
     if (!exampleRatingSv || exampleRatingSv.type !== "numeric") continue;
-    const codes = exampleRatingSv.validCodes;
+
+    const codes = resolveScaleCodes(ratingBase, ratingSlots);
     if (codes.length < 3 || codes[0] !== 1 || codes[codes.length - 1] < 4) continue;
 
     const scaleMax = codes.filter(c => c <= 10).at(-1) ?? codes[codes.length - 1];
@@ -1557,7 +1593,7 @@ export default function App() {
       const { issues: structIssues, datasetWarnings: structWarnings, columnSummary: colSummary } =
         runStructuralValidation(savVars, savVarMap, docxQMap, routingRules);
       const { issues: dataIssues, datasetWarnings: dataWarnings } =
-        runDataValidation(savRows, savVarMap, routingRules);
+        runDataValidation(savRows, savVarMap, routingRules, docxQMap);
       setIssues([...structIssues, ...dataIssues]);
       setDsWarnings([...structWarnings, ...dataWarnings]);
       setColumnSummary(colSummary);
