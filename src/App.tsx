@@ -124,10 +124,18 @@ function parseSavFile(buffer: ArrayBuffer): {
     return { ...legacySavScan(buffer), rows: [] };
   }
 
-  // Read fixed header fields (176-byte header, no leading record-type int)
-  const nominalCaseSize = readI32s(64); // number of 8-byte slots per case
-  const compressionCode = readI32s(68); // 0=uncompressed, 1=byte-code, 2=ZLIB
-  const bias            = readF64(80);  // compression bias (usually 100.0)
+  // Read fixed header fields (176-byte header layout):
+  //   [0-3]   magic "$FL2"/"$FL3"
+  //   [4-63]  product name (rest, 60 bytes)
+  //   [64-67] layout_code (always 2 for little-endian — not used here)
+  //   [68-71] nominal_case_size: number of 8-byte slots per case
+  //   [72-75] compression: 0=none, 1=byte-code, 2=ZLIB
+  //   [76-79] weight_index
+  //   [80-83] ncases
+  //   [84-91] bias: compression bias (always 100.0)
+  const nominalCaseSize = readI32s(68);
+  const compressionCode = readI32s(72);
+  const bias            = readF64(84);
 
   const variables: SavVariable[] = [];
   const varBySlot: (SavVariable | null)[] = [];
